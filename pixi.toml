@@ -1,0 +1,39 @@
+[workspace]
+authors = ["OpenAI Codex"]
+channels = ["conda-forge"]
+name = "triangle-splatting"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[activation.env]
+CUDA_HOME = "/usr/local/cuda-12.9"
+CC = "/usr/bin/gcc"
+CXX = "/usr/bin/g++"
+MAX_JOBS = "4"
+TORCH_CUDA_ARCH_LIST = "8.9"
+
+[dependencies]
+python = "3.11.*"
+pip = ">=24,<26"
+setuptools = ">=70,<81"
+wheel = ">=0.45,<1"
+ninja = ">=1.11,<2"
+
+[pypi-dependencies]
+torch = "==2.4.0"
+torchvision = "==0.19.0"
+tqdm = "*"
+plyfile = "*"
+open3d = "*"
+lpips = "*"
+mediapy = "*"
+opencv-python = "*"
+rerun-sdk = ">=0.26,<0.27"
+
+[tasks]
+build-rasterizer = "python -m pip install --no-build-isolation ./submodules/diff-triangle-rasterization"
+build-simple-knn = "python -m pip install --no-build-isolation ./submodules/simple-knn"
+train-help = "python train.py --help"
+render-help = "python render.py --help"
+metrics-help = "python metrics.py --help"
+smoke-cuda = "python -c \"import os, torch; print(f'cuda_home={os.environ.get(\\\"CUDA_HOME\\\")}'); print(f'torch={torch.__version__}'); print(f'torch_cuda={torch.version.cuda}'); print(f'cuda_available={torch.cuda.is_available()}')\""

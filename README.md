@@ -66,6 +66,30 @@ To render a scene, you can use the following command:
 python render.py -m <path_to_model>
 ```
 
+## Live Viewer
+If you want to inspect training or rendering live, you can stream images, metrics, and a sampled triangle mesh to a local Rerun viewer.
+
+Training example:
+```bash
+pixi run python train.py -s <path_to_scene> -m <output_model_path> --eval --rerun --rerun_spawn
+```
+
+Rendering example:
+```bash
+pixi run python render.py -m <path_to_model> --rerun --rerun_spawn
+```
+
+If you save a recording, you can reopen it later with:
+```bash
+pixi run rerun <path_to_recording.rrd>
+```
+
+Useful options:
+- `--rerun_save <path.rrd>` saves the recording for later playback.
+- `--rerun_image_every <N>` controls how often training images are logged.
+- `--rerun_mesh_every <N>` controls how often the live triangle mesh is refreshed.
+- `--rerun_max_triangles <N>` limits mesh logging to a sampled subset for responsiveness.
+
 ## Evaluation
 To evaluate the model, you can use the following command:
 ```bash
@@ -132,4 +156,3 @@ title={3D Convex Splatting: Radiance Field Rendering with 3D Smooth Convexes},
 This project is built upon 3D Convex Splatting and 3D Gaussian Splatting. We want to thank the authors for their contributions.
 
 J. Held and A. Cioppa are funded by the F.R.S.-FNRS. The research reported in this publication was supported by funding from KAUST Center of Excellence on GenAI, under award number 5940. This work was also supported by KAUST Ibn Rushd Postdoc Fellowship program. The present research benefited from computational resources made available on Lucia, the Tier-1 supercomputer of the Walloon Region, infrastructure funded by the Walloon Region under the grant agreement n°1910247.
-
