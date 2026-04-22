@@ -42,30 +42,31 @@ def post_process_mesh(mesh, cluster_to_keep=1000):
     print("num vertices post {}".format(len(mesh_0.vertices)))
     return mesh_0
 
-def to_cam_open3d(viewpoint_stack):
+def to_cam_open3d(viewpoint_stack, device=None):
+    if device is None:
+        device = o3d.core.Device("CPU:0")
+
     camera_traj = []
-    for i, viewpoint_cam in enumerate(viewpoint_stack):
+    for viewpoint_cam in viewpoint_stack:
         W = viewpoint_cam.image_width
         H = viewpoint_cam.image_height
         ndc2pix = torch.tensor([
-            [W / 2, 0, 0, (W-1) / 2],
-            [0, H / 2, 0, (H-1) / 2],
-            [0, 0, 0, 1]]).float().cuda().T
-        intrins =  (viewpoint_cam.projection_matrix @ ndc2pix)[:3,:3].T
-        intrinsic=o3d.camera.PinholeCameraIntrinsic(
-            width=viewpoint_cam.image_width,
-            height=viewpoint_cam.image_height,
-            cx = intrins[0,2].item(),
-            cy = intrins[1,2].item(), 
-            fx = intrins[0,0].item(), 
-            fy = intrins[1,1].item()
+            [W / 2, 0, 0, (W - 1) / 2],
+            [0, H / 2, 0, (H - 1) / 2],
+            [0, 0, 0, 1],
+        ], dtype=torch.float32).T
+        intrins = (viewpoint_cam.projection_matrix.detach().cpu() @ ndc2pix)[:3, :3].T
+        intrinsic = o3d.core.Tensor(
+            np.asarray(intrins.cpu().numpy(), dtype=np.float64),
+            dtype=o3d.core.float64,
+            device=device,
         )
-
-        extrinsic=np.asarray((viewpoint_cam.world_view_transform.T).cpu().numpy())
-        camera = o3d.camera.PinholeCameraParameters()
-        camera.extrinsic = extrinsic
-        camera.intrinsic = intrinsic
-        camera_traj.append(camera)
+        extrinsic = o3d.core.Tensor(
+            np.asarray(viewpoint_cam.world_view_transform.T.detach().cpu().numpy(), dtype=np.float64),
+            dtype=o3d.core.float64,
+            device=device,
+        )
+        camera_traj.append((intrinsic, extrinsic))
 
     return camera_traj
 
@@ -153,31 +154,64 @@ class GaussianExtractor(object):
         print(f'sdf_trunc: {sdf_trunc}')
         print(f'depth_truc: {depth_trunc}')
 
-        volume = o3d.pipelines.integration.ScalableTSDFVolume(
-            voxel_length= voxel_size,
-            sdf_trunc=sdf_trunc,
-            color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+        # The legacy Open3D TSDFVolume bindings segfault on this environment
+        # during integration, so use the tensor voxel grid backend instead.
+        device = o3d.core.Device("CPU:0")
+        trunc_voxel_multiplier = max(float(sdf_trunc / voxel_size), 1.0)
+        volume = o3d.t.geometry.VoxelBlockGrid(
+            attr_names=("tsdf", "weight", "color"),
+            attr_dtypes=(o3d.core.float32, o3d.core.float32, o3d.core.float32),
+            attr_channels=((1), (1), (3)),
+            voxel_size=voxel_size,
+            block_resolution=16,
+            block_count=max(10000, len(self.viewpoint_stack) * 256),
+            device=device,
         )
 
-        for i, cam_o3d in tqdm(enumerate(to_cam_open3d(self.viewpoint_stack)), desc="TSDF integration progress"):
+        camera_stack = to_cam_open3d(self.viewpoint_stack, device=device)
+        for i, (intrinsic, extrinsic) in tqdm(
+            enumerate(camera_stack), total=len(camera_stack), desc="TSDF integration progress"
+        ):
             rgb = self.rgbmaps[i]
-            depth = self.depthmaps[i]
+            depth = self.depthmaps[i].clone()
             
             # if we have mask provided, use it
             if mask_backgrond and (self.viewpoint_stack[i].gt_alpha_mask is not None):
                 depth[(self.viewpoint_stack[i].gt_alpha_mask < 0.5)] = 0
 
-            # make open3d rgbd
-            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-                o3d.geometry.Image(np.asarray(np.clip(rgb.permute(1,2,0).cpu().numpy(), 0.0, 1.0) * 255, order="C", dtype=np.uint8)),
-                o3d.geometry.Image(np.asarray(depth.permute(1,2,0).cpu().numpy(), order="C")),
-                depth_trunc = depth_trunc, convert_rgb_to_intensity=False,
-                depth_scale = 1.0
+            rgb_np = np.ascontiguousarray(
+                np.clip(rgb.permute(1, 2, 0).cpu().numpy(), 0.0, 1.0) * 255
+            ).astype(np.uint8)
+            depth_np = depth.squeeze(0).cpu().numpy()
+            if depth_np.ndim != 2:
+                raise ValueError(f"Expected a single-channel depth map, got shape {depth_np.shape}")
+            depth_np = np.ascontiguousarray(
+                np.nan_to_num(depth_np, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
             )
 
-            volume.integrate(rgbd, intrinsic=cam_o3d.intrinsic, extrinsic=cam_o3d.extrinsic)
+            depth_image = o3d.t.geometry.Image(depth_np[..., None]).to(device)
+            color_image = o3d.t.geometry.Image(rgb_np.astype(np.float32) / 255.0).to(device)
 
-        mesh = volume.extract_triangle_mesh()
+            block_coords = volume.compute_unique_block_coordinates(
+                depth_image,
+                intrinsic,
+                extrinsic,
+                depth_scale=1.0,
+                depth_max=depth_trunc,
+                trunc_voxel_multiplier=trunc_voxel_multiplier,
+            )
+            volume.integrate(
+                block_coords,
+                depth_image,
+                color_image,
+                intrinsic,
+                extrinsic,
+                depth_scale=1.0,
+                depth_max=depth_trunc,
+                trunc_voxel_multiplier=trunc_voxel_multiplier,
+            )
+
+        mesh = volume.extract_triangle_mesh().to_legacy()
         return mesh
 
     @torch.no_grad()
