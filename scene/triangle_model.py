@@ -681,8 +681,12 @@ class TriangleModel:
     def _sample_alives(self, probs, num, big_mask, alive_indices=None):
         probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
         probs = torch.clamp(probs, min=0.0)
-        probs = probs / (probs.sum() + torch.finfo(torch.float32).eps)
-        sampled_idxs = torch.multinomial(probs, min(num, (probs>0).sum().item()), replacement=False)
+        positive_count = int((probs > 0).sum().item())
+        if num <= 0 or positive_count == 0:
+            return torch.empty((0,), dtype=torch.long, device=probs.device)
+
+        probs = probs / (probs.sum() + torch.finfo(probs.dtype).eps)
+        sampled_idxs = torch.multinomial(probs, min(num, positive_count), replacement=False)
 
         if alive_indices is not None:
             sampled_idxs = alive_indices[sampled_idxs]
