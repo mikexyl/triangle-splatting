@@ -176,6 +176,11 @@ def training(
             iter_end.record()
             
             with torch.no_grad():
+                # Some drivers require the recorded events to complete before
+                # querying elapsed time, otherwise `elapsed_time` can raise
+                # "CUDA error: device not ready" even though the iteration
+                # itself succeeded.
+                torch.cuda.synchronize()
                 elapsed_ms = iter_start.elapsed_time(iter_end)
                 rerun_logger.log_training_iteration(
                     iteration=iteration,
@@ -382,7 +387,12 @@ if __name__ == "__main__":
     parser.add_argument("--rerun_save", type=str, default=None)
     parser.add_argument("--rerun_image_every", type=int, default=25)
     parser.add_argument("--rerun_mesh_every", type=int, default=100)
-    parser.add_argument("--rerun_max_triangles", type=int, default=5000)
+    parser.add_argument(
+        "--rerun_max_triangles",
+        type=int,
+        default=5000,
+        help="Maximum number of triangles to log to Rerun. Use 0 to log all triangles.",
+    )
     
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)

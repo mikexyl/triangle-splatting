@@ -28,7 +28,7 @@ open3d = "*"
 lpips = "*"
 mediapy = "*"
 opencv-python = "*"
-rerun-sdk = ">=0.26,<0.27"
+rerun-sdk = ">=0.31,<0.32"
 
 [tasks]
 build-rasterizer = "python -m pip install --no-build-isolation ./submodules/diff-triangle-rasterization"

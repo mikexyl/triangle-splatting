@@ -97,7 +97,12 @@ if __name__ == "__main__":
     parser.add_argument("--rerun", action="store_true")
     parser.add_argument("--rerun_spawn", action="store_true")
     parser.add_argument("--rerun_save", type=str, default=None)
-    parser.add_argument("--rerun_max_triangles", type=int, default=5000)
+    parser.add_argument(
+        "--rerun_max_triangles",
+        type=int,
+        default=5000,
+        help="Maximum number of triangles to log to Rerun. Use 0 to log all triangles.",
+    )
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 

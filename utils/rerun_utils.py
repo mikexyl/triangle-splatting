@@ -57,17 +57,18 @@ class RerunConfig:
     enabled: bool
     spawn: bool
     save_path: str | None
-    max_triangles: int
+    max_triangles: int | None
     mesh_every: int
     image_every: int
 
 
 def create_rerun_config(args: Any) -> RerunConfig:
+    max_triangles = int(getattr(args, "rerun_max_triangles", 5000))
     return RerunConfig(
         enabled=bool(getattr(args, "rerun", False)),
         spawn=bool(getattr(args, "rerun_spawn", False)),
         save_path=getattr(args, "rerun_save", None),
-        max_triangles=int(getattr(args, "rerun_max_triangles", 5000)),
+        max_triangles=None if max_triangles <= 0 else max_triangles,
         mesh_every=max(1, int(getattr(args, "rerun_mesh_every", 100))),
         image_every=max(1, int(getattr(args, "rerun_image_every", 25))),
     )
@@ -313,7 +314,7 @@ class RerunLogger:
         triangle_alpha = opacity.detach().reshape(-1, 1).clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8).cpu().numpy()
         triangle_rgba = np.concatenate([triangle_colors, triangle_alpha], axis=1)
 
-        if triangles.shape[0] > self.config.max_triangles:
+        if self.config.max_triangles is not None and triangles.shape[0] > self.config.max_triangles:
             keep = np.linspace(0, triangles.shape[0] - 1, self.config.max_triangles, dtype=np.int64)
             triangles = triangles[keep]
             triangle_rgba = triangle_rgba[keep]

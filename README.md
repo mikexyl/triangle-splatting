@@ -88,7 +88,7 @@ Useful options:
 - `--rerun_save <path.rrd>` saves the recording for later playback.
 - `--rerun_image_every <N>` controls how often training images are logged.
 - `--rerun_mesh_every <N>` controls how often the live triangle mesh is refreshed.
-- `--rerun_max_triangles <N>` limits mesh logging to a sampled subset for responsiveness.
+- `--rerun_max_triangles <N>` limits mesh logging to a sampled subset for responsiveness. Use `0` to log all triangles.
 
 ## Evaluation
 To evaluate the model, you can use the following command:
