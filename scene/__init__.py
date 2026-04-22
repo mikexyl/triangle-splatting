@@ -40,6 +40,12 @@ class Scene:
         self.model_path = args.model_path
         self.loaded_iter = None
         self.triangles = triangles
+        self.online_train_enabled = False
+        self.online_train_initial_count = 0
+        self.online_train_growth_interval = 0
+        self.online_train_growth_count = 1
+        self.online_train_window_size = 0
+        self.online_train_counts = {}
 
         if load_iteration:
             if load_iteration == -1:
@@ -98,7 +104,65 @@ class Scene:
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.triangles.save(point_cloud_path)
 
+    def enable_online_train_schedule(self, initial_count, growth_interval, growth_count, window_size=0):
+        if initial_count <= 0:
+            raise ValueError(f"initial_count must be > 0, got {initial_count}")
+        if growth_interval <= 0:
+            raise ValueError(f"growth_interval must be > 0, got {growth_interval}")
+        if growth_count <= 0:
+            raise ValueError(f"growth_count must be > 0, got {growth_count}")
+        if window_size < 0:
+            raise ValueError(f"window_size must be >= 0, got {window_size}")
+
+        self.online_train_enabled = True
+        self.online_train_initial_count = initial_count
+        self.online_train_growth_interval = growth_interval
+        self.online_train_growth_count = growth_count
+        self.online_train_window_size = window_size
+        self.online_train_counts = {
+            scale: min(initial_count, len(cameras))
+            for scale, cameras in self.train_cameras.items()
+        }
+
+    def update_online_train_set(self, iteration):
+        if not self.online_train_enabled:
+            return False
+
+        updated = False
+        steps = max(iteration - 1, 0) // self.online_train_growth_interval
+        for scale, cameras in self.train_cameras.items():
+            target_count = min(
+                len(cameras),
+                self.online_train_initial_count + steps * self.online_train_growth_count,
+            )
+            if target_count != self.online_train_counts[scale]:
+                self.online_train_counts[scale] = target_count
+                updated = True
+        return updated
+
+    def getActiveTrainCameraCount(self, scale=1.0):
+        if not self.online_train_enabled:
+            return len(self.train_cameras[scale])
+        return self.online_train_counts[scale]
+
+    def getActiveTrainWindowCount(self, scale=1.0):
+        if not self.online_train_enabled:
+            return len(self.train_cameras[scale])
+        return len(self.getTrainCameras(scale))
+
+    def getTotalTrainCameraCount(self, scale=1.0):
+        return len(self.train_cameras[scale])
+
+    def getActiveTrainWindowStart(self, scale=1.0):
+        if not self.online_train_enabled or self.online_train_window_size <= 0:
+            return 0
+        return max(0, self.online_train_counts[scale] - self.online_train_window_size)
+
     def getTrainCameras(self, scale=1.0):
+        if self.online_train_enabled:
+            window_end = self.online_train_counts[scale]
+            window_start = self.getActiveTrainWindowStart(scale)
+            return self.train_cameras[scale][window_start:window_end]
         return self.train_cameras[scale]
 
     def getTestCameras(self, scale=1.0):

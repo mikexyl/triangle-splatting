@@ -61,7 +61,32 @@ def training(
     try:
         # Load parameters, triangles and scene
         triangles = TriangleModel(dataset.sh_degree)
-        scene = Scene(dataset, triangles, opt.set_opacity, opt.triangle_size, opt.nb_points, opt.set_sigma, no_dome)
+        online_train = getattr(dataset, "online_train", False)
+        scene = Scene(
+            dataset,
+            triangles,
+            opt.set_opacity,
+            opt.triangle_size,
+            opt.nb_points,
+            opt.set_sigma,
+            no_dome,
+            shuffle=not online_train,
+        )
+        if online_train:
+            scene.enable_online_train_schedule(
+                initial_count=dataset.online_train_initial_cameras,
+                growth_interval=dataset.online_train_camera_growth_interval,
+                growth_count=dataset.online_train_camera_growth_count,
+                window_size=dataset.online_train_window_size,
+            )
+            print(
+                "Primitive online train replay enabled: "
+                "this mode only reveals frames incrementally and optionally restricts optimization "
+                "to a sliding local window. It does not yet implement a robust online mapping pipeline. "
+                f"{scene.getActiveTrainCameraCount()}/{scene.getTotalTrainCameraCount()} "
+                f"train cameras revealed, optimizing window of {scene.getActiveTrainWindowCount()} "
+                f"frames starting at index {scene.getActiveTrainWindowStart()}"
+            )
         triangles.training_setup(opt, opt.lr_mask, opt.feature_lr, opt.opacity_lr, opt.lr_sigma, opt.lr_triangles_points_init)
         
         if checkpoint:
@@ -76,6 +101,8 @@ def training(
 
         viewpoint_stack = scene.getTrainCameras().copy()
         number_of_views = len(viewpoint_stack)
+        if number_of_views == 0:
+            raise RuntimeError("Training requires at least one active train camera.")
 
         ema_loss_for_log = 0.0
         progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
@@ -101,6 +128,15 @@ def training(
 
             triangles.update_learning_rate(iteration)
 
+            if scene.update_online_train_set(iteration):
+                viewpoint_stack = scene.getTrainCameras().copy()
+                print(
+                    f"[ITER {iteration}] Online train replay: "
+                    f"{scene.getActiveTrainCameraCount()}/{scene.getTotalTrainCameraCount()} "
+                    f"train cameras revealed, optimizing window of {scene.getActiveTrainWindowCount()} "
+                    f"frames starting at index {scene.getActiveTrainWindowStart()}"
+                )
+
             # Every 1000 its we increase the levels of SH up to a maximum degree
             if iteration % 1000 == 0:
                 triangles.oneupSHdegree()
@@ -113,6 +149,7 @@ def training(
                 else:
                     new_round = False
 
+            number_of_views = len(scene.getTrainCameras())
             viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
 
@@ -215,7 +252,21 @@ def training(
                 if iteration % 1000 == 0:
                     total_dead = 0
 
-                if iteration < opt.densify_until_iter and iteration % opt.densification_interval == 0 and iteration > opt.densify_from_iter:
+                active_train_views = scene.getActiveTrainCameraCount() if online_train else number_of_views
+                allow_online_pruning = (not online_train) or active_train_views >= dataset.online_train_min_prune_cameras
+
+                if (
+                    iteration < opt.densify_until_iter
+                    and iteration % opt.densification_interval == 0
+                    and iteration > opt.densify_from_iter
+                ):
+                    if not allow_online_pruning:
+                        print(
+                            f"[ITER {iteration}] Skipping densification/pruning until "
+                            f"{dataset.online_train_min_prune_cameras} train cameras are active "
+                            f"(currently {active_train_views})"
+                        )
+                        continue
                     
                     if number_of_views < 250:
                         dead_mask = torch.logical_or((triangles.importance_score < args.importance_threshold).squeeze(),(triangles.get_opacity <= args.opacity_dead).squeeze())
@@ -255,6 +306,14 @@ def training(
 
 
                 if iteration > opt.densify_until_iter and iteration % opt.densification_interval == 0:
+                    if not allow_online_pruning:
+                        print(
+                            f"[ITER {iteration}] Skipping final pruning until "
+                            f"{dataset.online_train_min_prune_cameras} train cameras are active "
+                            f"(currently {active_train_views})"
+                        )
+                        continue
+
                     if number_of_views < 250:
                         dead_mask = torch.logical_or((triangles.importance_score < args.importance_threshold).squeeze(),(triangles.get_opacity <= args.opacity_dead).squeeze())
                     else:
@@ -393,6 +452,42 @@ if __name__ == "__main__":
         default=5000,
         help="Maximum number of triangles to log to Rerun. Use 0 to log all triangles.",
     )
+    parser.add_argument(
+        "--online_train",
+        action="store_true",
+        default=False,
+        help="Enable a primitive incremental training replay that reveals train frames over time.",
+    )
+    parser.add_argument(
+        "--online_train_initial_cameras",
+        type=int,
+        default=1,
+        help="Initial number of train cameras made visible when replaying training online.",
+    )
+    parser.add_argument(
+        "--online_train_camera_growth_interval",
+        type=int,
+        default=1,
+        help="Reveal more train cameras every N iterations during online replay.",
+    )
+    parser.add_argument(
+        "--online_train_camera_growth_count",
+        type=int,
+        default=1,
+        help="Number of additional train cameras to reveal at each online replay step.",
+    )
+    parser.add_argument(
+        "--online_train_window_size",
+        type=int,
+        default=0,
+        help="Sliding local optimization window size over the revealed train cameras; 0 uses the full revealed prefix in this primitive incremental replay.",
+    )
+    parser.add_argument(
+        "--online_train_min_prune_cameras",
+        type=int,
+        default=250,
+        help="Minimum number of active train cameras before the primitive incremental replay enables densification/pruning.",
+    )
     
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -412,6 +507,12 @@ if __name__ == "__main__":
         "rerun_image_every",
         "rerun_mesh_every",
         "rerun_max_triangles",
+        "online_train",
+        "online_train_initial_cameras",
+        "online_train_camera_growth_interval",
+        "online_train_camera_growth_count",
+        "online_train_window_size",
+        "online_train_min_prune_cameras",
     ):
         setattr(dataset_args, name, getattr(args, name))
 
