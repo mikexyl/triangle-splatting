@@ -45,6 +45,8 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    time_ns: int | None = None
+    mesh_seed_path: str | None = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -52,6 +54,14 @@ class SceneInfo(NamedTuple):
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
+
+
+def _sort_cam_infos_by_time(cam_infos):
+    if not cam_infos:
+        return cam_infos
+    if any(getattr(cam_info, "time_ns", None) is None for cam_info in cam_infos):
+        return cam_infos
+    return sorted(cam_infos, key=lambda cam_info: cam_info.time_ns)
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -225,7 +235,8 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             FovX = fovx
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
+                            time_ns=frame.get("time_ns"), mesh_seed_path=frame.get("mesh_seed_path")))
             
     return cam_infos
 
@@ -234,9 +245,13 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
     train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
     print("Reading Test Transforms")
     test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
+
+    train_cam_infos = _sort_cam_infos_by_time(train_cam_infos)
+    test_cam_infos = _sort_cam_infos_by_time(test_cam_infos)
     
     if not eval:
         train_cam_infos.extend(test_cam_infos)
+        train_cam_infos = _sort_cam_infos_by_time(train_cam_infos)
         test_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)

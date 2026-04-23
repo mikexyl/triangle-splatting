@@ -393,7 +393,6 @@ class TriangleModel:
         return np.asarray(points)
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, opacity : float, init_size : float, nb_points: int, set_sigma : float, no_dome: bool):
-
         self.spatial_lr_scale = spatial_lr_scale
         pcd_points = np.asarray(pcd.points)
         total_number_of_points = pcd_points.shape[0]
@@ -411,13 +410,22 @@ class TriangleModel:
 
         self.nb_points = nb_points
         self.spatial_lr_scale = spatial_lr_scale
-
-        fused_point_cloud = torch.tensor(np.asarray(total_points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(total_colors)).float().cuda())
-
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
-        features[:, :3, 0 ] = fused_color
-        features[:, 3:, 1:] = 0.0
+        (
+            fused_point_cloud,
+            features_dc,
+            features_rest,
+            points_per_triangle,
+            opacities,
+            sigmas,
+            masks,
+        ) = self._build_triangle_tensors_from_points(
+            np.asarray(total_points),
+            np.asarray(total_colors),
+            init_size,
+            opacity,
+            nb_points,
+            set_sigma,
+        )
 
         x, y, z = fused_point_cloud[:, 0], fused_point_cloud[:, 1], fused_point_cloud[:, 2]
 
@@ -446,11 +454,8 @@ class TriangleModel:
         cumsum_of_points_per_triangle = torch.cumsum(torch.nn.functional.pad(tensor_num_points_per_triangle, (1,0), value=0), 0, dtype=torch.int)[:-1]
         number_of_points = points_per_triangle.shape[0]
 
-        opacities = inverse_sigmoid(opacity * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
-        sigmas = self.inverse_exponential_activation(torch.ones((number_of_points, 1), dtype=torch.float, device="cuda") *  set_sigma)
-                    
-        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_dc = nn.Parameter(features_dc.requires_grad_(True))
+        self._features_rest = nn.Parameter(features_rest.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self._triangles_points = nn.Parameter(points_per_triangle.to('cuda').requires_grad_(True))
         self._sigma = nn.Parameter(sigmas.requires_grad_(True))
@@ -464,6 +469,66 @@ class TriangleModel:
         self.triangle_area = torch.zeros((fused_point_cloud.shape[0]), dtype=torch.float, device="cuda")
         self.image_size = torch.zeros((fused_point_cloud.shape[0]), dtype=torch.float, device="cuda")
         self.importance_score = torch.zeros((fused_point_cloud.shape[0]), dtype=torch.float, device="cuda")
+
+    def _build_triangle_tensors_from_points(self, points_np, colors_np, init_size, opacity, nb_points, set_sigma):
+        fused_point_cloud = torch.tensor(np.asarray(points_np)).float().cuda()
+        fused_color = RGB2SH(torch.tensor(np.asarray(colors_np)).float().cuda())
+
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        x, y, z = fused_point_cloud[:, 0], fused_point_cloud[:, 1], fused_point_cloud[:, 2]
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(points_np)).float().cuda()), 0.0000001)
+        radii = init_size * torch.sqrt(dist2).unsqueeze(1)
+        points_per_triangle = generate_triangles_in_chunks(x, y, z, radii, nb_points)
+        opacities = inverse_sigmoid(opacity * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        sigmas = self.inverse_exponential_activation(torch.ones((points_per_triangle.shape[0], 1), dtype=torch.float, device="cuda") * set_sigma)
+        masks = torch.ones((fused_point_cloud.shape[0], 1), device="cuda")
+
+        return (
+            fused_point_cloud,
+            features[:, :, 0:1].transpose(1, 2).contiguous(),
+            features[:, :, 1:].transpose(1, 2).contiguous(),
+            points_per_triangle,
+            opacities,
+            sigmas,
+            masks,
+        )
+
+    def append_from_pcd(self, pcd: BasicPointCloud, init_size: float, opacity: float, nb_points: int, set_sigma: float):
+        if pcd is None or len(pcd.points) == 0:
+            return 0
+
+        if self.optimizer is None:
+            raise RuntimeError("append_from_pcd requires training_setup() to be called first")
+
+        (
+            _fused_point_cloud,
+            new_features_dc,
+            new_features_rest,
+            new_triangles_points,
+            new_opacities,
+            new_sigma,
+            new_mask,
+        ) = self._build_triangle_tensors_from_points(
+            np.asarray(pcd.points),
+            np.asarray(pcd.colors),
+            init_size,
+            opacity,
+            nb_points,
+            set_sigma,
+        )
+
+        self.densification_postfix(
+            new_triangles_points,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_sigma,
+            new_mask,
+        )
+        return int(new_triangles_points.shape[0])
 
     def training_setup(self, training_args, lr_mask, lr_features, lr_opacity, lr_sigma, lr_triangles_points_init):
 
@@ -606,6 +671,8 @@ class TriangleModel:
         self.max_radii2D = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
         self.max_density_factor = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
         self.triangle_area = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
+        self.image_size = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
+        self.importance_score = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
 
         self.max_scaling = torch.cat((self.max_scaling, torch.zeros(new_opacities.shape[0], device="cuda")),dim=0)
 

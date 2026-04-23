@@ -9,6 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import os
+
 from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch
@@ -48,10 +50,21 @@ def loadCam(args, id, cam_info, resolution_scale):
         loaded_mask = None
         gt_image = resized_image_rgb
 
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
-                  image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+    camera = Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                    FoVx=cam_info.FovX, FoVy=cam_info.FovY,
+                    image=gt_image, gt_alpha_mask=loaded_mask,
+                    image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+
+    if getattr(cam_info, "time_ns", None) is not None:
+        camera.time_ns = int(cam_info.time_ns)
+
+    mesh_seed_path = getattr(cam_info, "mesh_seed_path", None)
+    if mesh_seed_path:
+        camera.seed_points_path = mesh_seed_path if os.path.isabs(mesh_seed_path) else os.path.abspath(
+            os.path.join(args.source_path, mesh_seed_path)
+        )
+
+    return camera
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

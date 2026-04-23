@@ -1,0 +1,609 @@
+import os
+import uuid
+from argparse import Namespace
+from dataclasses import dataclass
+from random import randint
+
+import lpips
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from scene import Scene, TriangleModel
+from scene.dataset_readers import fetchPly
+from triangle_renderer import render
+from utils.image_utils import psnr
+from utils.loss_utils import equilateral_regularizer, l1_loss, l2_loss, ssim
+from utils.rerun_utils import RerunLogger, create_rerun_config
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+
+    TENSORBOARD_FOUND = True
+except ImportError:
+    TENSORBOARD_FOUND = False
+
+
+RERUN_ARG_NAMES = (
+    "rerun",
+    "rerun_spawn",
+    "rerun_save",
+    "rerun_image_every",
+    "rerun_mesh_every",
+    "rerun_max_triangles",
+)
+
+ONLINE_TRAIN_ARG_NAMES = (
+    "online_train_initial_cameras",
+    "online_train_camera_growth_interval",
+    "online_train_camera_growth_count",
+    "online_train_window_size",
+    "online_train_min_prune_cameras",
+)
+
+
+@dataclass(frozen=True)
+class TrainingRunConfig:
+    rerun_app_id: str
+    online_train: bool = False
+    online_train_initial_cameras: int = 1
+    online_train_camera_growth_interval: int = 10
+    online_train_camera_growth_count: int = 1
+    online_train_window_size: int = 0
+    online_train_min_prune_cameras: int = 250
+
+
+def add_common_training_args(parser) -> None:
+    parser.add_argument("--debug_from", type=int, default=-1)
+    parser.add_argument("--detect_anomaly", action="store_true", default=False)
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument("--no_dome", action="store_true", default=False)
+    parser.add_argument("--outdoor", action="store_true", default=False)
+
+
+def add_rerun_args(parser) -> None:
+    parser.add_argument("--rerun", action="store_true")
+    parser.add_argument("--rerun_spawn", action="store_true")
+    parser.add_argument("--rerun_save", type=str, default=None)
+    parser.add_argument("--rerun_image_every", type=int, default=25)
+    parser.add_argument("--rerun_mesh_every", type=int, default=100)
+    parser.add_argument(
+        "--rerun_max_triangles",
+        type=int,
+        default=5000,
+        help="Maximum number of triangles to log to Rerun. Use 0 to log all triangles.",
+    )
+
+
+def add_online_training_args(parser) -> None:
+    parser.add_argument(
+        "--online_train_initial_cameras",
+        type=int,
+        default=1,
+        help="Initial number of train cameras made visible in the primitive online replay.",
+    )
+    parser.add_argument(
+        "--online_train_camera_growth_interval",
+        type=int,
+        default=10,
+        help="Reveal more train cameras every N iterations during the primitive online replay.",
+    )
+    parser.add_argument(
+        "--online_train_camera_growth_count",
+        type=int,
+        default=1,
+        help="Number of additional train cameras to reveal at each replay step.",
+    )
+    parser.add_argument(
+        "--online_train_window_size",
+        type=int,
+        default=0,
+        help="Sliding local optimization window over the revealed train cameras; 0 uses the full revealed prefix.",
+    )
+    parser.add_argument(
+        "--online_train_min_prune_cameras",
+        type=int,
+        default=250,
+        help="Minimum number of revealed train cameras before densification/pruning is allowed.",
+    )
+
+
+def copy_named_args(target, source, names) -> None:
+    for name in names:
+        setattr(target, name, getattr(source, name))
+
+
+def _merge_point_clouds(point_clouds):
+    valid_clouds = [pcd for pcd in point_clouds if pcd is not None and len(pcd.points) > 0]
+    if not valid_clouds:
+        return None
+
+    return valid_clouds[0].__class__(
+        points=np.concatenate([np.asarray(pcd.points) for pcd in valid_clouds], axis=0),
+        colors=np.concatenate([np.asarray(pcd.colors) for pcd in valid_clouds], axis=0),
+        normals=np.concatenate([np.asarray(pcd.normals) for pcd in valid_clouds], axis=0),
+    )
+
+
+def _append_online_seed_geometry(triangles, views, seen_seed_paths, opt):
+    seed_paths = []
+    for view in views:
+        seed_path = getattr(view, "seed_points_path", None)
+        if not seed_path or seed_path in seen_seed_paths:
+            continue
+        seen_seed_paths.add(seed_path)
+        seed_paths.append(seed_path)
+
+    if not seed_paths:
+        return 0
+
+    seed_point_cloud = _merge_point_clouds([fetchPly(seed_path) for seed_path in seed_paths])
+    if seed_point_cloud is None:
+        return 0
+
+    return triangles.append_from_pcd(
+        seed_point_cloud,
+        init_size=opt.triangle_size,
+        opacity=opt.set_opacity,
+        nb_points=opt.nb_points,
+        set_sigma=opt.set_sigma,
+    )
+
+
+def run_training(
+    dataset,
+    opt,
+    pipe,
+    no_dome,
+    outdoor,
+    testing_iterations,
+    save_iterations,
+    checkpoint,
+    debug_from,
+    run_config: TrainingRunConfig,
+):
+    lpips_fn = lpips.LPIPS(net="vgg").to(device="cuda")
+
+    first_iter = 0
+    tb_writer = prepare_output_and_logger(dataset)
+    rerun_logger = RerunLogger(run_config.rerun_app_id, create_rerun_config(dataset))
+
+    try:
+        triangles = TriangleModel(dataset.sh_degree)
+        scene = Scene(
+            dataset,
+            triangles,
+            opt.set_opacity,
+            opt.triangle_size,
+            opt.nb_points,
+            opt.set_sigma,
+            no_dome,
+            shuffle=not run_config.online_train,
+        )
+        if run_config.online_train:
+            scene.enable_online_train_schedule(
+                initial_count=run_config.online_train_initial_cameras,
+                growth_interval=run_config.online_train_camera_growth_interval,
+                growth_count=run_config.online_train_camera_growth_count,
+                window_size=run_config.online_train_window_size,
+            )
+            print(
+                "Primitive online train replay enabled: "
+                "this mode only reveals frames incrementally and optionally restricts optimization "
+                "to a sliding local window. It does not yet implement a robust online mapping pipeline. "
+                f"{scene.getActiveTrainCameraCount()}/{scene.getTotalTrainCameraCount()} "
+                f"train cameras revealed, optimizing window of {scene.getActiveTrainWindowCount()} "
+                f"frames starting at index {scene.getActiveTrainWindowStart()}"
+            )
+            rerun_logger.log_online_setup(
+                train_views=scene.getAllTrainCameras(),
+                test_views=scene.getTestCameras(),
+            )
+        seen_online_seed_paths = set()
+        if run_config.online_train:
+            seen_online_seed_paths = {
+                view.seed_points_path
+                for view in scene.getRevealedTrainCameras()
+                if getattr(view, "seed_points_path", None)
+            }
+        active_train_count = scene.getActiveTrainCameraCount()
+
+        triangles.training_setup(
+            opt,
+            opt.lr_mask,
+            opt.feature_lr,
+            opt.opacity_lr,
+            opt.lr_sigma,
+            opt.lr_triangles_points_init,
+        )
+
+        if checkpoint:
+            (model_params, first_iter) = torch.load(checkpoint)
+            triangles.restore(model_params, opt)
+
+        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+        iter_start = torch.cuda.Event(enable_timing=True)
+        iter_end = torch.cuda.Event(enable_timing=True)
+
+        viewpoint_stack = scene.getTrainCameras().copy()
+        number_of_views = len(viewpoint_stack)
+        if number_of_views == 0:
+            raise RuntimeError("Training requires at least one active train camera.")
+
+        ema_loss_for_log = 0.0
+        progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+        first_iter += 1
+
+        total_dead = 0
+        opacity_now = True
+        new_round = False
+        removed_them = False
+
+        large_scene = triangles.large
+        loss_fn = l2_loss if large_scene and outdoor else l1_loss
+
+        for iteration in range(first_iter, opt.iterations + 1):
+            iter_start.record()
+            triangles.update_learning_rate(iteration)
+
+            online_schedule_changed = False
+            if run_config.online_train and scene.update_online_train_set(iteration):
+                online_schedule_changed = True
+                newly_revealed_views = scene.getNewlyRevealedTrainCameras(active_train_count)
+                added_triangles = _append_online_seed_geometry(
+                    triangles,
+                    newly_revealed_views,
+                    seen_online_seed_paths,
+                    opt,
+                )
+                active_train_count = scene.getActiveTrainCameraCount()
+                viewpoint_stack = scene.getTrainCameras().copy()
+                print(
+                    f"[ITER {iteration}] Online train replay: "
+                    f"{scene.getActiveTrainCameraCount()}/{scene.getTotalTrainCameraCount()} "
+                    f"train cameras revealed, optimizing window of {scene.getActiveTrainWindowCount()} "
+                    f"frames starting at index {scene.getActiveTrainWindowStart()}"
+                )
+                if added_triangles > 0:
+                    print(f"[ITER {iteration}] Added {added_triangles} triangles from newly revealed frame meshes")
+
+            if iteration % 1000 == 0:
+                triangles.oneupSHdegree()
+
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy()
+                if not new_round and removed_them:
+                    new_round = True
+                    removed_them = False
+                else:
+                    new_round = False
+
+            number_of_views = len(scene.getTrainCameras())
+            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+
+            if (iteration - 1) == debug_from:
+                pipe.debug = True
+
+            bg = torch.rand((3), device="cuda") if opt.random_background else background
+
+            render_pkg = render(viewpoint_cam, triangles, pipe, bg)
+            image = render_pkg["render"]
+            triangle_area = render_pkg["density_factor"].detach()
+            image_size = render_pkg["scaling"].detach()
+            importance_score = render_pkg["max_blending"].detach()
+
+            if new_round:
+                mask = triangle_area > 1
+                triangles.triangle_area[mask] += 1
+
+            mask = image_size > triangles.image_size
+            triangles.image_size[mask] = image_size[mask]
+            mask = importance_score > triangles.importance_score
+            triangles.importance_score[mask] = importance_score[mask]
+
+            gt_image = viewpoint_cam.original_image.cuda()
+            pixel_loss = loss_fn(image, gt_image)
+            loss_image = (1.0 - opt.lambda_dssim) * pixel_loss + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+            loss_opacity = torch.abs(triangles.get_opacity).mean() * opt.lambda_opacity
+
+            rend_normal = render_pkg["rend_normal"]
+            surf_normal = render_pkg["surf_normal"]
+            lambda_dist = opt.lambda_dist if iteration > opt.iteration_mesh else 0
+            lambda_normal = opt.lambda_normals if iteration > opt.iteration_mesh else 0
+            rend_dist = render_pkg["rend_dist"]
+            dist_loss = lambda_dist * (rend_dist).mean()
+            normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
+            normal_loss = lambda_normal * (normal_error).mean()
+
+            loss_size = 1 / equilateral_regularizer(triangles.get_triangles_points).mean()
+            loss_size = loss_size * opt.lambda_size
+
+            if iteration < opt.densify_until_iter:
+                loss = loss_image + loss_opacity + normal_loss + dist_loss + loss_size
+            else:
+                loss = loss_image + loss_opacity + normal_loss + dist_loss
+
+            loss.backward()
+
+            iter_end.record()
+
+            with torch.no_grad():
+                torch.cuda.synchronize()
+                elapsed_ms = iter_start.elapsed_time(iter_end)
+
+                if run_config.online_train:
+                    rerun_logger.log_online_iteration(
+                        iteration=iteration,
+                        scene=scene,
+                        current_view=viewpoint_cam,
+                        total_loss=loss.item(),
+                        pixel_loss=pixel_loss.item(),
+                        elapsed_ms=elapsed_ms,
+                        total_triangles=scene.triangles.get_triangles_points.shape[0],
+                        triangles_points=scene.triangles.get_triangles_points,
+                        features_dc=scene.triangles._features_dc,
+                        opacity=scene.triangles.get_opacity,
+                        render_image=image,
+                        gt_image=gt_image,
+                        schedule_changed=online_schedule_changed,
+                    )
+                else:
+                    rerun_logger.log_training_iteration(
+                        iteration=iteration,
+                        total_loss=loss.item(),
+                        pixel_loss=pixel_loss.item(),
+                        elapsed_ms=elapsed_ms,
+                        total_triangles=scene.triangles.get_triangles_points.shape[0],
+                        triangles_points=scene.triangles.get_triangles_points,
+                        features_dc=scene.triangles._features_dc,
+                        opacity=scene.triangles.get_opacity,
+                        render_image=image,
+                        gt_image=gt_image,
+                    )
+
+                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+                if iteration % 10 == 0:
+                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.5f}"})
+                    progress_bar.update(10)
+                if iteration == opt.iterations:
+                    progress_bar.close()
+
+                training_report(
+                    tb_writer,
+                    iteration,
+                    pixel_loss,
+                    loss,
+                    loss_fn,
+                    elapsed_ms,
+                    testing_iterations,
+                    scene,
+                    render,
+                    (pipe, background),
+                    lpips_fn,
+                    rerun_logger,
+                )
+                if iteration in save_iterations:
+                    print(f"\n[ITER {iteration}] Saving Triangles")
+                    scene.save(iteration)
+                if iteration % 1000 == 0:
+                    total_dead = 0
+
+                active_train_views = scene.getActiveTrainCameraCount() if run_config.online_train else number_of_views
+                allow_online_pruning = (not run_config.online_train) or (
+                    active_train_views >= run_config.online_train_min_prune_cameras
+                )
+
+                if (
+                    iteration < opt.densify_until_iter
+                    and iteration % opt.densification_interval == 0
+                    and iteration > opt.densify_from_iter
+                ):
+                    if not allow_online_pruning:
+                        print(
+                            f"[ITER {iteration}] Skipping densification/pruning until "
+                            f"{run_config.online_train_min_prune_cameras} train cameras are active "
+                            f"(currently {active_train_views})"
+                        )
+                        continue
+
+                    if number_of_views < 250:
+                        dead_mask = torch.logical_or(
+                            (triangles.importance_score < opt.importance_threshold).squeeze(),
+                            (triangles.get_opacity <= opt.opacity_dead).squeeze(),
+                        )
+                    else:
+                        if not new_round:
+                            dead_mask = torch.logical_or(
+                                (triangles.importance_score < opt.importance_threshold).squeeze(),
+                                (triangles.get_opacity <= opt.opacity_dead).squeeze(),
+                            )
+                        else:
+                            dead_mask = (triangles.get_opacity <= opt.opacity_dead).squeeze()
+
+                    if iteration > 1000 and not new_round:
+                        mask_test = triangles.triangle_area < 2
+                        dead_mask = torch.logical_or(dead_mask, mask_test.squeeze())
+
+                        if not outdoor:
+                            mask_test = triangles.image_size > 1400
+                            dead_mask = torch.logical_or(dead_mask, mask_test.squeeze())
+
+                    total_dead += dead_mask.sum()
+
+                    if opt.proba_distr == 0:
+                        odd_group = True
+                    elif opt.proba_distr == 1:
+                        odd_group = False
+                    else:
+                        if opacity_now:
+                            odd_group = opacity_now
+                            opacity_now = False
+                        else:
+                            odd_group = opacity_now
+                            opacity_now = True
+
+                    removed_them = True
+                    new_round = False
+
+                    triangles.add_new_gs(cap_max=opt.max_shapes, oddGroup=odd_group, dead_mask=dead_mask)
+
+                if iteration > opt.densify_until_iter and iteration % opt.densification_interval == 0:
+                    if not allow_online_pruning:
+                        print(
+                            f"[ITER {iteration}] Skipping final pruning until "
+                            f"{run_config.online_train_min_prune_cameras} train cameras are active "
+                            f"(currently {active_train_views})"
+                        )
+                        continue
+
+                    if number_of_views < 250:
+                        dead_mask = torch.logical_or(
+                            (triangles.importance_score < opt.importance_threshold).squeeze(),
+                            (triangles.get_opacity <= opt.opacity_dead).squeeze(),
+                        )
+                    else:
+                        if not new_round:
+                            dead_mask = torch.logical_or(
+                                (triangles.importance_score < opt.importance_threshold).squeeze(),
+                                (triangles.get_opacity <= opt.opacity_dead).squeeze(),
+                            )
+                        else:
+                            dead_mask = (triangles.get_opacity <= opt.opacity_dead).squeeze()
+
+                    if not new_round:
+                        mask_test = triangles.triangle_area < 2
+                        dead_mask = torch.logical_or(dead_mask, mask_test.squeeze())
+                    triangles.remove_final_points(dead_mask)
+                    removed_them = True
+                    new_round = False
+
+                if iteration < opt.iterations:
+                    triangles.optimizer.step()
+                    triangles.optimizer.zero_grad(set_to_none=True)
+    finally:
+        rerun_logger.close()
+
+    print("Training is done")
+
+
+def prepare_output_and_logger(args):
+    if not args.model_path:
+        if os.getenv("OAR_JOB_ID"):
+            unique_str = os.getenv("OAR_JOB_ID")
+        else:
+            unique_str = str(uuid.uuid4())
+        args.model_path = os.path.join("./output/", unique_str[0:10])
+
+    print(f"Output folder: {args.model_path}")
+    os.makedirs(args.model_path, exist_ok=True)
+    with open(os.path.join(args.model_path, "cfg_args"), "w") as cfg_log_f:
+        cfg_log_f.write(str(Namespace(**vars(args))))
+
+    if TENSORBOARD_FOUND:
+        return SummaryWriter(args.model_path)
+
+    print("Tensorboard not available: not logging progress")
+    return None
+
+
+def training_report(
+    tb_writer,
+    iteration,
+    pixel_loss,
+    loss,
+    loss_fn,
+    elapsed,
+    testing_iterations,
+    scene,
+    render_func,
+    render_args,
+    lpips_fn,
+    rerun_logger=None,
+):
+    if tb_writer:
+        tb_writer.add_scalar("train_loss_patches/pixel_loss", pixel_loss.item(), iteration)
+        tb_writer.add_scalar("train_loss_patches/total_loss", loss.item(), iteration)
+        tb_writer.add_scalar("iter_time", elapsed, iteration)
+
+    if iteration in testing_iterations:
+        torch.cuda.empty_cache()
+        validation_configs = (
+            {"name": "test", "cameras": scene.getTestCameras()},
+            {
+                "name": "train",
+                "cameras": [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)],
+            },
+        )
+
+        for config in validation_configs:
+            if config["cameras"] and len(config["cameras"]) > 0:
+                pixel_loss_test = 0.0
+                psnr_test = 0.0
+                ssim_test = 0.0
+                lpips_test = 0.0
+                total_time = 0.0
+                image = None
+                gt_image = None
+
+                for idx, viewpoint in enumerate(config["cameras"]):
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    start_event.record()
+                    image = torch.clamp(render_func(viewpoint, scene.triangles, *render_args)["render"], 0.0, 1.0)
+                    end_event.record()
+                    torch.cuda.synchronize()
+                    total_time += start_event.elapsed_time(end_event)
+
+                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    if tb_writer and idx < 5:
+                        tb_writer.add_images(
+                            f"{config['name']}_view_{viewpoint.image_name}/render",
+                            image[None],
+                            global_step=iteration,
+                        )
+                        if iteration == testing_iterations[0]:
+                            tb_writer.add_images(
+                                f"{config['name']}_view_{viewpoint.image_name}/ground_truth",
+                                gt_image[None],
+                                global_step=iteration,
+                            )
+                    pixel_loss_test += loss_fn(image, gt_image).mean().double()
+                    psnr_test += psnr(image, gt_image).mean().double()
+                    ssim_test += ssim(image, gt_image).mean().double()
+                    lpips_test += lpips_fn(image, gt_image).mean().double()
+
+                psnr_test /= len(config["cameras"])
+                pixel_loss_test /= len(config["cameras"])
+                ssim_test /= len(config["cameras"])
+                lpips_test /= len(config["cameras"])
+                total_time /= len(config["cameras"])
+                print(
+                    f"\n[ITER {iteration}] Evaluating {config['name']}: "
+                    f"L1 {pixel_loss_test} PSNR {psnr_test} SSIM {ssim_test} LPIPS {lpips_test}"
+                )
+                if rerun_logger is not None:
+                    rerun_logger.log_validation_iteration(
+                        iteration=iteration,
+                        split_name=config["name"],
+                        l1_loss=float(pixel_loss_test),
+                        psnr=float(psnr_test),
+                        ssim=float(ssim_test),
+                        lpips=float(lpips_test),
+                        render_image=image,
+                        gt_image=gt_image,
+                    )
+
+                if tb_writer:
+                    tb_writer.add_scalar(f"{config['name']}/loss_viewpoint - l1_loss", pixel_loss_test, iteration)
+                    tb_writer.add_scalar(f"{config['name']}/loss_viewpoint - psnr", psnr_test, iteration)
+
+        if tb_writer:
+            tb_writer.add_histogram("scene/opacity_histogram", scene.triangles.get_opacity, iteration)
+            tb_writer.add_scalar("total_points", scene.triangles.get_triangles_points.shape[0], iteration)
+        torch.cuda.empty_cache()

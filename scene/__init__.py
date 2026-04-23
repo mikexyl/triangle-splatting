@@ -23,11 +23,43 @@
 import os
 import random
 import json
+import numpy as np
 from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks
+from scene.dataset_readers import fetchPly, sceneLoadTypeCallbacks
 from scene.triangle_model import TriangleModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+
+
+def _merge_point_clouds(point_clouds):
+    valid_clouds = [pcd for pcd in point_clouds if pcd is not None and len(pcd.points) > 0]
+    if not valid_clouds:
+        return None
+
+    return valid_clouds[0].__class__(
+        points=np.concatenate([np.asarray(pcd.points) for pcd in valid_clouds], axis=0),
+        colors=np.concatenate([np.asarray(pcd.colors) for pcd in valid_clouds], axis=0),
+        normals=np.concatenate([np.asarray(pcd.normals) for pcd in valid_clouds], axis=0),
+    )
+
+
+def _build_initial_online_seed_point_cloud(source_path, cam_infos, initial_count):
+    if initial_count <= 0:
+        return None
+
+    seed_paths = []
+    seen_paths = set()
+    for cam_info in cam_infos[:min(initial_count, len(cam_infos))]:
+        seed_rel_path = getattr(cam_info, "mesh_seed_path", None)
+        if not seed_rel_path or seed_rel_path in seen_paths:
+            continue
+        seen_paths.add(seed_rel_path)
+        seed_paths.append(os.path.join(source_path, seed_rel_path))
+
+    if not seed_paths:
+        return None
+
+    return _merge_point_clouds([fetchPly(seed_path) for seed_path in seed_paths if os.path.exists(seed_path)])
 
 class Scene:
 
@@ -83,6 +115,24 @@ class Scene:
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
+        initial_point_cloud = scene_info.point_cloud
+        if (
+            not self.loaded_iter
+            and getattr(args, "online_train_incremental_seed", False)
+            and getattr(args, "online_train_initial_cameras", 0) > 0
+        ):
+            online_seed_point_cloud = _build_initial_online_seed_point_cloud(
+                args.source_path,
+                scene_info.train_cameras,
+                args.online_train_initial_cameras,
+            )
+            if online_seed_point_cloud is not None:
+                initial_point_cloud = online_seed_point_cloud
+                print(
+                    "Using incremental online seed initialization from the first "
+                    f"{min(args.online_train_initial_cameras, len(scene_info.train_cameras))} revealed train frames"
+                )
+
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
         for resolution_scale in resolution_scales:
@@ -98,7 +148,7 @@ class Scene:
                                                 )
                                     )
         else:
-            self.triangles.create_from_pcd(scene_info.point_cloud, self.cameras_extent, init_opacity, init_size, nb_points, set_sigma, no_dome)
+            self.triangles.create_from_pcd(initial_point_cloud, self.cameras_extent, init_opacity, init_size, nb_points, set_sigma, no_dome)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
@@ -148,7 +198,7 @@ class Scene:
     def getActiveTrainWindowCount(self, scale=1.0):
         if not self.online_train_enabled:
             return len(self.train_cameras[scale])
-        return len(self.getTrainCameras(scale))
+        return len(self.getActiveTrainWindow(scale))
 
     def getTotalTrainCameraCount(self, scale=1.0):
         return len(self.train_cameras[scale])
@@ -158,12 +208,31 @@ class Scene:
             return 0
         return max(0, self.online_train_counts[scale] - self.online_train_window_size)
 
-    def getTrainCameras(self, scale=1.0):
-        if self.online_train_enabled:
-            window_end = self.online_train_counts[scale]
-            window_start = self.getActiveTrainWindowStart(scale)
-            return self.train_cameras[scale][window_start:window_end]
+    def getAllTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]
+
+    def getRevealedTrainCameras(self, scale=1.0):
+        if not self.online_train_enabled:
+            return self.train_cameras[scale]
+        return self.train_cameras[scale][:self.online_train_counts[scale]]
+
+    def getNewlyRevealedTrainCameras(self, previous_count, scale=1.0):
+        if not self.online_train_enabled:
+            return []
+        current_count = self.online_train_counts[scale]
+        if previous_count >= current_count:
+            return []
+        return self.train_cameras[scale][previous_count:current_count]
+
+    def getActiveTrainWindow(self, scale=1.0):
+        if not self.online_train_enabled:
+            return self.train_cameras[scale]
+        window_end = self.online_train_counts[scale]
+        window_start = self.getActiveTrainWindowStart(scale)
+        return self.train_cameras[scale][window_start:window_end]
+
+    def getTrainCameras(self, scale=1.0):
+        return self.getActiveTrainWindow(scale)
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]

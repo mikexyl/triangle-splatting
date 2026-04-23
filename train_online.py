@@ -28,9 +28,11 @@ import torch
 from arguments import ModelParams, OptimizationParams, PipelineParams
 from utils.general_utils import safe_state
 from utils.train_runner import (
+    ONLINE_TRAIN_ARG_NAMES,
     RERUN_ARG_NAMES,
     TrainingRunConfig,
     add_common_training_args,
+    add_online_training_args,
     add_rerun_args,
     copy_named_args,
     run_training,
@@ -38,12 +40,13 @@ from utils.train_runner import (
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Offline training script parameters")
+    parser = ArgumentParser(description="Primitive online replay training parameters")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
     add_common_training_args(parser)
     add_rerun_args(parser)
+    add_online_training_args(parser)
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -54,6 +57,8 @@ if __name__ == "__main__":
 
     dataset_args = lp.extract(args)
     copy_named_args(dataset_args, args, RERUN_ARG_NAMES)
+    copy_named_args(dataset_args, args, ONLINE_TRAIN_ARG_NAMES)
+    dataset_args.online_train_incremental_seed = True
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     run_training(
@@ -66,7 +71,15 @@ if __name__ == "__main__":
         args.save_iterations,
         args.start_checkpoint,
         args.debug_from,
-        TrainingRunConfig(rerun_app_id="triangle_splatting.train"),
+        TrainingRunConfig(
+            rerun_app_id="triangle_splatting.online",
+            online_train=True,
+            online_train_initial_cameras=args.online_train_initial_cameras,
+            online_train_camera_growth_interval=args.online_train_camera_growth_interval,
+            online_train_camera_growth_count=args.online_train_camera_growth_count,
+            online_train_window_size=args.online_train_window_size,
+            online_train_min_prune_cameras=args.online_train_min_prune_cameras,
+        ),
     )
 
     print("\nTraining complete.")
