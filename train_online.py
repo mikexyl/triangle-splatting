@@ -30,6 +30,7 @@ from utils.general_utils import safe_state
 from utils.train_runner import (
     ONLINE_TRAIN_ARG_NAMES,
     RERUN_ARG_NAMES,
+    SEED_INIT_ARG_NAMES,
     TrainingRunConfig,
     add_common_training_args,
     add_online_training_args,
@@ -58,6 +59,7 @@ if __name__ == "__main__":
     dataset_args = lp.extract(args)
     copy_named_args(dataset_args, args, RERUN_ARG_NAMES)
     copy_named_args(dataset_args, args, ONLINE_TRAIN_ARG_NAMES)
+    copy_named_args(dataset_args, args, SEED_INIT_ARG_NAMES)
     dataset_args.online_train_incremental_seed = True
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)

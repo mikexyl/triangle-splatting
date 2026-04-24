@@ -64,6 +64,14 @@ def loadCam(args, id, cam_info, resolution_scale):
             os.path.join(args.source_path, mesh_seed_path)
         )
 
+    mesh_seed_triangle_path = getattr(cam_info, "mesh_seed_triangle_path", None)
+    if mesh_seed_triangle_path:
+        camera.seed_triangles_path = (
+            mesh_seed_triangle_path if os.path.isabs(mesh_seed_triangle_path) else os.path.abspath(
+                os.path.join(args.source_path, mesh_seed_triangle_path)
+            )
+        )
+
     return camera
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):

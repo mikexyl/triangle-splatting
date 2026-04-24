@@ -25,7 +25,7 @@ import random
 import json
 import numpy as np
 from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import fetchPly, sceneLoadTypeCallbacks
+from scene.dataset_readers import fetchPly, fetchTriangleSoup, sceneLoadTypeCallbacks
 from scene.triangle_model import TriangleModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
@@ -40,6 +40,17 @@ def _merge_point_clouds(point_clouds):
         points=np.concatenate([np.asarray(pcd.points) for pcd in valid_clouds], axis=0),
         colors=np.concatenate([np.asarray(pcd.colors) for pcd in valid_clouds], axis=0),
         normals=np.concatenate([np.asarray(pcd.normals) for pcd in valid_clouds], axis=0),
+    )
+
+
+def _merge_triangle_soups(triangle_soups):
+    valid_soups = [soup for soup in triangle_soups if soup is not None and len(soup[0]) > 0]
+    if not valid_soups:
+        return None
+
+    return (
+        np.concatenate([soup[0] for soup in valid_soups], axis=0),
+        np.concatenate([soup[1] for soup in valid_soups], axis=0),
     )
 
 
@@ -60,6 +71,33 @@ def _build_initial_online_seed_point_cloud(source_path, cam_infos, initial_count
         return None
 
     return _merge_point_clouds([fetchPly(seed_path) for seed_path in seed_paths if os.path.exists(seed_path)])
+
+
+def _build_initial_online_seed_triangle_soup(source_path, cam_infos, initial_count):
+    if initial_count <= 0:
+        return None
+
+    seed_paths = []
+    seen_paths = set()
+    for cam_info in cam_infos[:min(initial_count, len(cam_infos))]:
+        seed_rel_path = getattr(cam_info, "mesh_seed_triangle_path", None)
+        if not seed_rel_path or seed_rel_path in seen_paths:
+            continue
+        seen_paths.add(seed_rel_path)
+        seed_paths.append(os.path.join(source_path, seed_rel_path))
+
+    if not seed_paths:
+        return None
+
+    return _merge_triangle_soups([fetchTriangleSoup(seed_path) for seed_path in seed_paths if os.path.exists(seed_path)])
+
+
+def _load_offline_seed_triangle_soup(source_path):
+    merged_path = os.path.join(source_path, "mesh_seed_triangles", "all.npz")
+    if os.path.exists(merged_path):
+        return fetchTriangleSoup(merged_path)
+    return None
+
 
 class Scene:
 
@@ -115,23 +153,42 @@ class Scene:
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
+        seed_init_mode = getattr(args, "seed_init_mode", "point")
+        if seed_init_mode not in ("point", "mesh_triangle"):
+            raise ValueError(f"Unsupported seed_init_mode: {seed_init_mode}")
+
         initial_point_cloud = scene_info.point_cloud
+        initial_triangle_soup = None
         if (
             not self.loaded_iter
             and getattr(args, "online_train_incremental_seed", False)
             and getattr(args, "online_train_initial_cameras", 0) > 0
         ):
-            online_seed_point_cloud = _build_initial_online_seed_point_cloud(
-                args.source_path,
-                scene_info.train_cameras,
-                args.online_train_initial_cameras,
-            )
-            if online_seed_point_cloud is not None:
-                initial_point_cloud = online_seed_point_cloud
-                print(
-                    "Using incremental online seed initialization from the first "
-                    f"{min(args.online_train_initial_cameras, len(scene_info.train_cameras))} revealed train frames"
+            if seed_init_mode == "mesh_triangle":
+                initial_triangle_soup = _build_initial_online_seed_triangle_soup(
+                    args.source_path,
+                    scene_info.train_cameras,
+                    args.online_train_initial_cameras,
                 )
+                if initial_triangle_soup is not None:
+                    print(
+                        "Using incremental online triangle-soup seed initialization from the first "
+                        f"{min(args.online_train_initial_cameras, len(scene_info.train_cameras))} revealed train frames"
+                    )
+            else:
+                online_seed_point_cloud = _build_initial_online_seed_point_cloud(
+                    args.source_path,
+                    scene_info.train_cameras,
+                    args.online_train_initial_cameras,
+                )
+                if online_seed_point_cloud is not None:
+                    initial_point_cloud = online_seed_point_cloud
+                    print(
+                        "Using incremental online seed initialization from the first "
+                        f"{min(args.online_train_initial_cameras, len(scene_info.train_cameras))} revealed train frames"
+                    )
+        elif not self.loaded_iter and seed_init_mode == "mesh_triangle":
+            initial_triangle_soup = _load_offline_seed_triangle_soup(args.source_path)
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
@@ -148,7 +205,24 @@ class Scene:
                                                 )
                                     )
         else:
-            self.triangles.create_from_pcd(initial_point_cloud, self.cameras_extent, init_opacity, init_size, nb_points, set_sigma, no_dome)
+            if seed_init_mode == "mesh_triangle":
+                if initial_triangle_soup is None:
+                    raise RuntimeError(
+                        "seed_init_mode=mesh_triangle requires Kimera triangle seed files. "
+                        "Run scripts/prepare_kimera_capture_dataset.py to generate mesh_seed_triangles/*.npz."
+                    )
+                self.triangles.create_from_triangle_soup(
+                    initial_triangle_soup[0],
+                    initial_triangle_soup[1],
+                    self.cameras_extent,
+                    init_opacity,
+                    init_size,
+                    nb_points,
+                    set_sigma,
+                    no_dome,
+                )
+            else:
+                self.triangles.create_from_pcd(initial_point_cloud, self.cameras_extent, init_opacity, init_size, nb_points, set_sigma, no_dome)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))

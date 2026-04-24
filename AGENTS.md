@@ -6,11 +6,12 @@ Top-level scripts drive the main workflow: `train.py`, `render.py`, `metrics.py`
 ## Build, Test, and Development Commands
 Create the environment with `micromamba create -f requirements.yaml` (Python 3.11, CUDA 12.6). Build the rasterizer with `bash compile.sh`, then install KNN with `cd submodules/simple-knn && pip install .`. Main workflows:
 
-- `python train.py -s <scene_dir> -m <output_dir> --eval` trains a model.
-- `python train.py -s <scene_dir> -m <output_dir> --outdoor --eval` uses outdoor settings.
+- Put training, rendering, metric, and evaluation outputs under `output/` by default, for example `-m output/<run_name>`. Use `/tmp` only for explicitly temporary scratch runs.
+- `python train.py -s <scene_dir> -m output/<run_name> --eval` trains a model.
+- `python train.py -s <scene_dir> -m output/<run_name> --outdoor --eval` uses outdoor settings.
 - `python render.py -m <model_dir>` renders train/test views.
 - `python metrics.py -m <model_dir>` computes SSIM, PSNR, and LPIPS.
-- `python full_eval.py --output_path <eval_dir> -m360 <mipnerf360_root> -tat <tat_root>` reproduces the paper pipeline.
+- `python full_eval.py --output_path output/<eval_name> -m360 <mipnerf360_root> -tat <tat_root>` reproduces the paper pipeline.
 
 ## Coding Style & Naming Conventions
 Follow the existing Python style: 4-space indentation, `snake_case` for functions, variables, and files, and `CapWords` for classes. Keep imports grouped as standard library, third-party, and local modules. Match the current CLI style in `arguments/__init__.py`: descriptive long flags, short aliases only when already established. No formatter or linter is configured, so keep changes small, consistent, and readable.

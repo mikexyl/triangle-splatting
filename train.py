@@ -29,6 +29,7 @@ from arguments import ModelParams, OptimizationParams, PipelineParams
 from utils.general_utils import safe_state
 from utils.train_runner import (
     RERUN_ARG_NAMES,
+    SEED_INIT_ARG_NAMES,
     TrainingRunConfig,
     add_common_training_args,
     add_rerun_args,
@@ -54,6 +55,7 @@ if __name__ == "__main__":
 
     dataset_args = lp.extract(args)
     copy_named_args(dataset_args, args, RERUN_ARG_NAMES)
+    copy_named_args(dataset_args, args, SEED_INIT_ARG_NAMES)
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     run_training(

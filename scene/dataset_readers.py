@@ -47,6 +47,7 @@ class CameraInfo(NamedTuple):
     height: int
     time_ns: int | None = None
     mesh_seed_path: str | None = None
+    mesh_seed_triangle_path: str | None = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -132,6 +133,22 @@ def fetchPly(path):
     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
+
+def fetchTriangleSoup(path):
+    with np.load(path) as data:
+        triangles = np.asarray(data["triangles"], dtype=np.float32)
+        if "colors" in data:
+            colors = np.asarray(data["colors"], dtype=np.float32)
+        else:
+            colors = np.full((triangles.shape[0], 3), 180.0 / 255.0, dtype=np.float32)
+
+    if triangles.ndim != 3 or triangles.shape[1:] != (3, 3):
+        raise ValueError(f"Triangle soup {path} must contain a triangles array with shape [N, 3, 3]")
+
+    if colors.ndim != 2 or colors.shape != (triangles.shape[0], 3):
+        raise ValueError(f"Triangle soup {path} colors must have shape [N, 3]")
+
+    return triangles, colors
 
 def storePly(path, xyz, rgb):
     # Define the dtype for the structured array
@@ -236,7 +253,8 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
-                            time_ns=frame.get("time_ns"), mesh_seed_path=frame.get("mesh_seed_path")))
+                            time_ns=frame.get("time_ns"), mesh_seed_path=frame.get("mesh_seed_path"),
+                            mesh_seed_triangle_path=frame.get("mesh_seed_triangle_path")))
             
     return cam_infos
 

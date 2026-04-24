@@ -356,6 +356,12 @@ if __name__ == "__main__":
 
     parser.add_argument("--no_dome", action="store_true", default=False)
     parser.add_argument("--outdoor", action="store_true", default=False)
+    parser.add_argument(
+        "--seed_init_mode",
+        choices=("point", "mesh_triangle"),
+        default="point",
+        help="Initial geometry seed mode. 'point' keeps the existing point-cloud path; 'mesh_triangle' uses Kimera mesh triangle-soup seeds.",
+    )
     
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -369,7 +375,10 @@ if __name__ == "__main__":
 
     # Configure and run training
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args),
+    dataset_args = lp.extract(args)
+    dataset_args.seed_init_mode = args.seed_init_mode
+
+    training(dataset_args,
              op.extract(args),
              pp.extract(args),
              args.no_dome,

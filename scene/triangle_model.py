@@ -376,6 +376,11 @@ class TriangleModel:
             self.active_sh_degree += 1
 
     def fibonacci_sphere(self, samples=1000):
+        if samples <= 0:
+            return np.empty((0, 3))
+        if samples == 1:
+            return np.asarray([(0.0, 1.0, 0.0)])
+
         points = []
         phi = math.pi * (math.sqrt(5.) - 1.)
 
@@ -391,6 +396,160 @@ class TriangleModel:
             points.append((x, y, z))
 
         return np.asarray(points)
+
+    def _triangle_metadata_from_points(self, points_per_triangle):
+        tensor_num_points_per_triangle = torch.full(
+            (points_per_triangle.shape[0],),
+            points_per_triangle.shape[1],
+            dtype=torch.int,
+            device=points_per_triangle.device,
+        )
+        cumsum_of_points_per_triangle = torch.cumsum(
+            torch.nn.functional.pad(tensor_num_points_per_triangle, (1, 0), value=0),
+            0,
+            dtype=torch.int,
+        )[:-1]
+        return tensor_num_points_per_triangle, cumsum_of_points_per_triangle, points_per_triangle.shape[0]
+
+    def _prepare_triangle_soup_arrays(self, triangles_np, colors_np=None):
+        triangles_np = np.asarray(triangles_np, dtype=np.float32)
+        if triangles_np.ndim != 3 or triangles_np.shape[1:] != (3, 3):
+            raise ValueError("Triangle soup initialization expects triangles with shape [N, 3, 3]")
+
+        original_count = triangles_np.shape[0]
+        if original_count == 0:
+            raise ValueError("Triangle soup initialization requires at least one triangle")
+
+        edge_a = triangles_np[:, 1] - triangles_np[:, 0]
+        edge_b = triangles_np[:, 2] - triangles_np[:, 0]
+        areas = 0.5 * np.linalg.norm(np.cross(edge_a, edge_b), axis=1)
+        valid_mask = np.isfinite(triangles_np).all(axis=(1, 2)) & (areas > 1e-12)
+
+        if colors_np is None:
+            colors_np = np.full((original_count, 3), 180.0 / 255.0, dtype=np.float32)
+        else:
+            colors_np = np.asarray(colors_np, dtype=np.float32)
+            if colors_np.ndim != 2 or colors_np.shape != (original_count, 3):
+                raise ValueError("Triangle soup colors must have shape [N, 3]")
+
+        triangles_np = triangles_np[valid_mask]
+        colors_np = colors_np[valid_mask]
+        if triangles_np.shape[0] == 0:
+            raise ValueError("Triangle soup contains no valid non-degenerate triangles")
+
+        if colors_np.max() > 1.0:
+            colors_np = colors_np / 255.0
+        colors_np = np.clip(colors_np, 0.0, 1.0)
+
+        return triangles_np, colors_np
+
+    def _build_triangle_tensors_from_triangle_soup(self, triangles_np, colors_np, opacity, set_sigma):
+        triangles_np, colors_np = self._prepare_triangle_soup_arrays(triangles_np, colors_np)
+        points_per_triangle = torch.tensor(triangles_np).float().cuda()
+        fused_color = RGB2SH(torch.tensor(colors_np).float().cuda())
+
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        opacities = inverse_sigmoid(opacity * torch.ones((points_per_triangle.shape[0], 1), dtype=torch.float, device="cuda"))
+        sigmas = self.inverse_exponential_activation(torch.ones((points_per_triangle.shape[0], 1), dtype=torch.float, device="cuda") * set_sigma)
+        masks = torch.ones((points_per_triangle.shape[0], 1), device="cuda")
+
+        return (
+            features[:, :, 0:1].transpose(1, 2).contiguous(),
+            features[:, :, 1:].transpose(1, 2).contiguous(),
+            points_per_triangle,
+            opacities,
+            sigmas,
+            masks,
+        )
+
+    def _set_initial_triangle_tensors(self, points_per_triangle, features_dc, features_rest, opacities, sigmas, masks):
+        (
+            tensor_num_points_per_triangle,
+            cumsum_of_points_per_triangle,
+            number_of_points,
+        ) = self._triangle_metadata_from_points(points_per_triangle)
+
+        self._features_dc = nn.Parameter(features_dc.requires_grad_(True))
+        self._features_rest = nn.Parameter(features_rest.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._triangles_points = nn.Parameter(points_per_triangle.to('cuda').requires_grad_(True))
+        self._sigma = nn.Parameter(sigmas.requires_grad_(True))
+        self._num_points_per_triangle = tensor_num_points_per_triangle
+        self._cumsum_of_points_per_triangle = cumsum_of_points_per_triangle
+        self._number_of_points = number_of_points
+        self.max_scaling = torch.zeros((number_of_points), dtype=torch.float, device="cuda")
+        self.max_radii2D = torch.zeros((number_of_points), dtype=torch.float, device="cuda")
+        self.max_density_factor = torch.zeros((number_of_points), dtype=torch.float, device="cuda")
+        self._mask = nn.Parameter(masks.requires_grad_(True))
+        self.triangle_area = torch.zeros((number_of_points), dtype=torch.float, device="cuda")
+        self.image_size = torch.zeros((number_of_points), dtype=torch.float, device="cuda")
+        self.importance_score = torch.zeros((number_of_points), dtype=torch.float, device="cuda")
+
+    def create_from_triangle_soup(self, triangles_np, colors_np, spatial_lr_scale: float, opacity: float, init_size: float, nb_points: int, set_sigma: float, no_dome: bool):
+        if nb_points != 3:
+            raise ValueError("mesh_triangle seed initialization requires --nb_points 3")
+
+        self.nb_points = nb_points
+        self.spatial_lr_scale = spatial_lr_scale
+        (
+            features_dc,
+            features_rest,
+            points_per_triangle,
+            opacities,
+            sigmas,
+            masks,
+        ) = self._build_triangle_tensors_from_triangle_soup(
+            triangles_np,
+            colors_np,
+            opacity,
+            set_sigma,
+        )
+
+        if not no_dome:
+            shapes_to_add = int(points_per_triangle.shape[0] * 0.05)
+            if shapes_to_add > 0:
+                radius = max(float(torch.max(torch.abs(points_per_triangle)).detach().cpu()), 1e-6)
+                sky_box_points = self.fibonacci_sphere(shapes_to_add) * radius
+                (
+                    _sky_centers,
+                    sky_features_dc,
+                    sky_features_rest,
+                    sky_triangles,
+                    sky_opacities,
+                    sky_sigmas,
+                    sky_masks,
+                ) = self._build_triangle_tensors_from_points(
+                    sky_box_points,
+                    np.ones_like(sky_box_points),
+                    init_size,
+                    opacity,
+                    nb_points,
+                    set_sigma,
+                )
+                features_dc = torch.cat([sky_features_dc, features_dc], dim=0)
+                features_rest = torch.cat([sky_features_rest, features_rest], dim=0)
+                points_per_triangle = torch.cat([sky_triangles, points_per_triangle], dim=0)
+                opacities = torch.cat([sky_opacities, opacities], dim=0)
+                sigmas = torch.cat([sky_sigmas, sigmas], dim=0)
+                masks = torch.cat([sky_masks, masks], dim=0)
+
+        all_vertices = points_per_triangle.flatten(0, 1)
+        scene_extent = torch.max(torch.max(all_vertices, dim=0).values - torch.min(all_vertices, dim=0).values)
+        if float(scene_extent.detach().cpu()) > 300:
+            print("Scene is large, we increase the threshold")
+            self.large = True
+
+        self._set_initial_triangle_tensors(
+            points_per_triangle,
+            features_dc,
+            features_rest,
+            opacities,
+            sigmas,
+            masks,
+        )
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, opacity : float, init_size : float, nb_points: int, set_sigma : float, no_dome: bool):
         self.spatial_lr_scale = spatial_lr_scale
@@ -517,6 +676,37 @@ class TriangleModel:
             init_size,
             opacity,
             nb_points,
+            set_sigma,
+        )
+
+        self.densification_postfix(
+            new_triangles_points,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_sigma,
+            new_mask,
+        )
+        return int(new_triangles_points.shape[0])
+
+    def append_from_triangle_soup(self, triangles_np, colors_np, opacity: float, set_sigma: float):
+        if triangles_np is None or len(triangles_np) == 0:
+            return 0
+
+        if self.optimizer is None:
+            raise RuntimeError("append_from_triangle_soup requires training_setup() to be called first")
+
+        (
+            new_features_dc,
+            new_features_rest,
+            new_triangles_points,
+            new_opacities,
+            new_sigma,
+            new_mask,
+        ) = self._build_triangle_tensors_from_triangle_soup(
+            triangles_np,
+            colors_np,
+            opacity,
             set_sigma,
         )
 

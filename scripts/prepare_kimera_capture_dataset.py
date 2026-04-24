@@ -264,6 +264,87 @@ def _sample_mesh_surface_points(
     return sampled_points
 
 
+def _split_triangles_once(triangles: np.ndarray) -> np.ndarray:
+    a = triangles[:, 0]
+    b = triangles[:, 1]
+    c = triangles[:, 2]
+
+    ab = (a + b) * 0.5
+    ac = (a + c) * 0.5
+    bc = (b + c) * 0.5
+
+    return np.concatenate(
+        [
+            np.stack([a, ab, ac], axis=1),
+            np.stack([b, bc, ab], axis=1),
+            np.stack([c, ac, bc], axis=1),
+            np.stack([ab, bc, ac], axis=1),
+        ],
+        axis=0,
+    ).astype(np.float32, copy=False)
+
+
+def _triangle_max_edges(triangles: np.ndarray) -> np.ndarray:
+    edge_ab = np.linalg.norm(triangles[:, 1] - triangles[:, 0], axis=1)
+    edge_bc = np.linalg.norm(triangles[:, 2] - triangles[:, 1], axis=1)
+    edge_ca = np.linalg.norm(triangles[:, 0] - triangles[:, 2], axis=1)
+    return np.maximum(np.maximum(edge_ab, edge_bc), edge_ca)
+
+
+def _subdivide_triangles_by_max_edge(
+    triangles: np.ndarray,
+    max_edge: float,
+    max_count: int,
+) -> tuple[np.ndarray, bool]:
+    if len(triangles) == 0 or max_edge <= 0.0:
+        if max_count > 0 and len(triangles) > max_count:
+            return triangles[:max_count].astype(np.float32, copy=False), True
+        return triangles.astype(np.float32, copy=False), False
+
+    triangles = triangles.astype(np.float32, copy=False)
+    cap_reached = False
+    while True:
+        max_edges = _triangle_max_edges(triangles)
+        oversized_indices = np.nonzero(max_edges > max_edge)[0]
+        if len(oversized_indices) == 0:
+            break
+
+        if max_count > 0:
+            available_new_triangles = max_count - len(triangles)
+            split_count = min(len(oversized_indices), available_new_triangles // 3)
+            if split_count <= 0:
+                cap_reached = True
+                break
+
+            largest_order = np.argsort(max_edges[oversized_indices])[::-1]
+            selected_indices = oversized_indices[largest_order[:split_count]]
+            if split_count < len(oversized_indices):
+                cap_reached = True
+        else:
+            selected_indices = oversized_indices
+
+        keep_mask = np.ones(len(triangles), dtype=bool)
+        keep_mask[selected_indices] = False
+        triangles = np.concatenate(
+            [triangles[keep_mask], _split_triangles_once(triangles[selected_indices])],
+            axis=0,
+        )
+
+        if cap_reached:
+            break
+
+    return triangles.astype(np.float32, copy=False), cap_reached
+
+
+def _write_triangle_soup_npz(output_path: Path, triangles: np.ndarray) -> None:
+    colors = np.full((len(triangles), 3), 180.0 / 255.0, dtype=np.float32)
+    np.savez_compressed(
+        output_path,
+        triangles=triangles.astype(np.float32, copy=False),
+        colors=colors,
+    )
+
+
 def _write_point_cloud_ply(output_path: Path, points: np.ndarray) -> None:
     colors = np.full((len(points), 3), 180, dtype=np.uint8)
     normals = np.zeros_like(points, dtype=np.float32)
@@ -311,7 +392,9 @@ def _build_mesh_seed_entries(
     output_dir: Path,
     voxel_size: float,
     sample_spacing: float,
-) -> tuple[list[dict[str, object]], dict[str, object], np.ndarray]:
+    triangle_max_edge: float,
+    triangle_max_count: int,
+) -> tuple[list[dict[str, object]], dict[str, object], dict[str, object], np.ndarray, np.ndarray]:
     meshes_csv = capture_dir / "meshes.csv"
     if not meshes_csv.exists():
         return [], {
@@ -321,20 +404,32 @@ def _build_mesh_seed_entries(
             "input_face_count": 0,
             "sampled_point_count": 0,
             "output_point_count": 0,
-        }, np.empty((0, 3), dtype=np.float32)
+        }, {
+            "mesh_seed_file_count": 0,
+            "output_triangle_count": 0,
+            "cap_reached_file_count": 0,
+            "max_edge": float(triangle_max_edge),
+            "max_count": int(triangle_max_count),
+        }, np.empty((0, 3), dtype=np.float32), np.empty((0, 3, 3), dtype=np.float32)
 
     all_points = []
+    all_triangles = []
     mesh_seed_entries = []
     mesh_count = 0
     total_vertex_count = 0
     total_face_count = 0
     total_sampled_point_count = 0
+    total_output_triangle_count = 0
+    triangle_seed_file_count = 0
+    triangle_cap_reached_file_count = 0
     effective_sample_spacing = sample_spacing
     if effective_sample_spacing <= 0.0:
         effective_sample_spacing = voxel_size * 0.5 if voxel_size > 0.0 else 0.01
 
     mesh_seed_dir = output_dir / "mesh_seed_points"
     mesh_seed_dir.mkdir(parents=True, exist_ok=True)
+    triangle_seed_dir = output_dir / "mesh_seed_triangles"
+    triangle_seed_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(0)
     for row in _iter_capture_rows(meshes_csv):
         obj_filename = row.get("obj_filename", "").strip()
@@ -346,6 +441,35 @@ def _build_mesh_seed_entries(
         vertices, faces = _load_mesh_geometry(mesh_path)
         if len(vertices) == 0:
             continue
+
+        triangle_seed_rel_path = None
+        triangle_count = 0
+        triangle_cap_reached = False
+        if len(faces) > 0:
+            mesh_triangles = vertices[faces]
+            mesh_triangles, triangle_cap_reached = _subdivide_triangles_by_max_edge(
+                mesh_triangles,
+                max_edge=triangle_max_edge,
+                max_count=triangle_max_count,
+            )
+            if len(mesh_triangles) > 0:
+                triangle_seed_file_count += 1
+                triangle_count = int(len(mesh_triangles))
+                total_output_triangle_count += triangle_count
+                if triangle_cap_reached:
+                    triangle_cap_reached_file_count += 1
+                    cap_reason = (
+                        f"before all edges reached {triangle_max_edge}"
+                        if triangle_max_edge > 0.0
+                        else "because --mesh-triangle-max-count truncated the mesh"
+                    )
+                    print(
+                        f"[WARN] Triangle seed cap reached for {obj_filename}; "
+                        f"wrote {triangle_count} triangles {cap_reason}."
+                    )
+                all_triangles.append(mesh_triangles)
+                triangle_seed_rel_path = f"mesh_seed_triangles/{Path(obj_filename).stem}.npz"
+                _write_triangle_soup_npz(output_dir / triangle_seed_rel_path, mesh_triangles)
 
         surface_points = _sample_mesh_surface_points(vertices, faces, effective_sample_spacing, rng)
         mesh_points = np.concatenate([vertices, surface_points], axis=0) if len(surface_points) else vertices
@@ -365,7 +489,10 @@ def _build_mesh_seed_entries(
             {
                 "time_ns": int(mesh_timestamp) if mesh_timestamp else mesh_count - 1,
                 "seed_rel_path": seed_rel_path,
+                "triangle_seed_rel_path": triangle_seed_rel_path,
                 "point_count": int(len(mesh_points)),
+                "triangle_count": triangle_count,
+                "triangle_cap_reached": triangle_cap_reached,
                 "obj_filename": obj_filename,
             }
         )
@@ -378,9 +505,20 @@ def _build_mesh_seed_entries(
             "input_face_count": 0,
             "sampled_point_count": 0,
             "output_point_count": 0,
-        }, np.empty((0, 3), dtype=np.float32)
+        }, {
+            "mesh_seed_file_count": triangle_seed_file_count,
+            "output_triangle_count": total_output_triangle_count,
+            "cap_reached_file_count": triangle_cap_reached_file_count,
+            "max_edge": float(triangle_max_edge),
+            "max_count": int(triangle_max_count),
+        }, np.empty((0, 3), dtype=np.float32), np.empty((0, 3, 3), dtype=np.float32)
 
     points = _downsample_points(np.concatenate(all_points, axis=0), voxel_size)
+    triangles = (
+        np.concatenate(all_triangles, axis=0)
+        if all_triangles
+        else np.empty((0, 3, 3), dtype=np.float32)
+    )
     mesh_seed_entries.sort(key=lambda entry: entry["time_ns"])
     return mesh_seed_entries, {
         "mesh_count": mesh_count,
@@ -390,10 +528,16 @@ def _build_mesh_seed_entries(
         "sampled_point_count": total_sampled_point_count,
         "output_point_count": int(len(points)),
         "sample_spacing": float(effective_sample_spacing),
-    }, points
+    }, {
+        "mesh_seed_file_count": triangle_seed_file_count,
+        "output_triangle_count": int(len(triangles)),
+        "cap_reached_file_count": triangle_cap_reached_file_count,
+        "max_edge": float(triangle_max_edge),
+        "max_count": int(triangle_max_count),
+    }, points, triangles
 
 
-def _select_mesh_seed_path(frame_time_ns: int, mesh_seed_entries: list[dict[str, object]]) -> str | None:
+def _select_mesh_seed_entry(frame_time_ns: int, mesh_seed_entries: list[dict[str, object]]) -> dict[str, object] | None:
     if not mesh_seed_entries:
         return None
 
@@ -407,7 +551,7 @@ def _select_mesh_seed_path(frame_time_ns: int, mesh_seed_entries: list[dict[str,
         candidate_indices.append(insert_idx - 1)
 
     best_idx = min(candidate_indices, key=lambda idx: abs(int(mesh_times[idx]) - frame_time_ns))
-    return str(mesh_seed_entries[best_idx]["seed_rel_path"])
+    return mesh_seed_entries[best_idx]
 
 
 def _write_transforms_json(
@@ -448,6 +592,18 @@ def main() -> None:
         default=0.0,
         help="Approximate spacing used to interpolate seed points across mesh faces before voxel downsampling; <=0 uses half the voxel size.",
     )
+    parser.add_argument(
+        "--mesh-triangle-max-edge",
+        type=float,
+        default=0.0,
+        help="Split mesh seed triangles until their longest edge is at most this size in meters; <=0 disables subdivision.",
+    )
+    parser.add_argument(
+        "--mesh-triangle-max-count",
+        type=int,
+        default=500000,
+        help="Maximum triangles to write per mesh seed after subdivision; <=0 disables the cap.",
+    )
     args = parser.parse_args()
 
     capture_dir = Path(args.capture_dir).expanduser().resolve()
@@ -478,14 +634,18 @@ def main() -> None:
     new_fy = float(new_camera_matrix[1, 1])
     new_cx = float(new_camera_matrix[0, 2])
     new_cy = float(new_camera_matrix[1, 2])
-    mesh_seed_entries, point_cloud_stats, merged_seed_points = _build_mesh_seed_entries(
+    mesh_seed_entries, point_cloud_stats, triangle_soup_stats, merged_seed_points, merged_seed_triangles = _build_mesh_seed_entries(
         capture_dir,
         output_dir,
         voxel_size=args.mesh_voxel_size,
         sample_spacing=args.mesh_sample_spacing,
+        triangle_max_edge=args.mesh_triangle_max_edge,
+        triangle_max_count=args.mesh_triangle_max_count,
     )
     if len(merged_seed_points) > 0:
         _write_point_cloud_ply(output_dir / "points3d.ply", merged_seed_points)
+    if len(merged_seed_triangles) > 0:
+        _write_triangle_soup_npz(output_dir / "mesh_seed_triangles" / "all.npz", merged_seed_triangles)
 
     transformed_frames = []
     for row in frame_rows:
@@ -493,13 +653,20 @@ def main() -> None:
         output_stem = image_path.stem
         output_image_path = images_dir / f"{output_stem}.png"
         _undistort_image(image_path, output_image_path, calibration, new_camera_matrix)
-        mesh_seed_path = _select_mesh_seed_path(int(row["image_timestamp_ns"]), mesh_seed_entries)
+        mesh_seed_entry = _select_mesh_seed_entry(int(row["image_timestamp_ns"]), mesh_seed_entries)
+        mesh_seed_path = str(mesh_seed_entry["seed_rel_path"]) if mesh_seed_entry else None
+        mesh_seed_triangle_path = (
+            str(mesh_seed_entry.get("triangle_seed_rel_path"))
+            if mesh_seed_entry and mesh_seed_entry.get("triangle_seed_rel_path")
+            else None
+        )
         transformed_frames.append(
             {
                 "file_path": f"images/{output_stem}",
                 "time_ns": int(row["image_timestamp_ns"]),
                 "transform_matrix": _blender_transform_from_capture_pose(row["_camera_pose_world"]),
                 "mesh_seed_path": mesh_seed_path,
+                "mesh_seed_triangle_path": mesh_seed_triangle_path,
             }
         )
 
@@ -540,6 +707,7 @@ def main() -> None:
         "train_frame_count": len(train_frames),
         "test_frame_count": len(test_frames),
         "mesh_seed_directory": "mesh_seed_points" if mesh_seed_entries else None,
+        "mesh_seed_triangle_directory": "mesh_seed_triangles" if triangle_soup_stats["mesh_seed_file_count"] else None,
         "undistorted_intrinsics": {
             "fx": new_fx,
             "fy": new_fy,
@@ -549,6 +717,7 @@ def main() -> None:
             "height": calibration.height,
         },
         "point_cloud": point_cloud_stats,
+        "triangle_soup": triangle_soup_stats,
     }
     (output_dir / "kimera_conversion.json").write_text(
         json.dumps(conversion_summary, indent=2) + "\n",

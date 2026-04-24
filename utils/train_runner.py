@@ -10,7 +10,7 @@ import torch
 from tqdm import tqdm
 
 from scene import Scene, TriangleModel
-from scene.dataset_readers import fetchPly
+from scene.dataset_readers import fetchPly, fetchTriangleSoup
 from triangle_renderer import render
 from utils.image_utils import psnr
 from utils.loss_utils import equilateral_regularizer, l1_loss, l2_loss, ssim
@@ -41,6 +41,10 @@ ONLINE_TRAIN_ARG_NAMES = (
     "online_train_min_prune_cameras",
 )
 
+SEED_INIT_ARG_NAMES = (
+    "seed_init_mode",
+)
+
 
 @dataclass(frozen=True)
 class TrainingRunConfig:
@@ -63,6 +67,12 @@ def add_common_training_args(parser) -> None:
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument("--no_dome", action="store_true", default=False)
     parser.add_argument("--outdoor", action="store_true", default=False)
+    parser.add_argument(
+        "--seed_init_mode",
+        choices=("point", "mesh_triangle"),
+        default="point",
+        help="Initial geometry seed mode. 'point' keeps the existing point-cloud path; 'mesh_triangle' uses Kimera mesh triangle-soup seeds.",
+    )
 
 
 def add_rerun_args(parser) -> None:
@@ -129,10 +139,27 @@ def _merge_point_clouds(point_clouds):
     )
 
 
-def _append_online_seed_geometry(triangles, views, seen_seed_paths, opt):
+def _merge_triangle_soups(triangle_soups):
+    valid_soups = [soup for soup in triangle_soups if soup is not None and len(soup[0]) > 0]
+    if not valid_soups:
+        return None
+
+    return (
+        np.concatenate([soup[0] for soup in valid_soups], axis=0),
+        np.concatenate([soup[1] for soup in valid_soups], axis=0),
+    )
+
+
+def _get_view_seed_path(view, seed_init_mode):
+    if seed_init_mode == "mesh_triangle":
+        return getattr(view, "seed_triangles_path", None)
+    return getattr(view, "seed_points_path", None)
+
+
+def _append_online_seed_geometry(triangles, views, seen_seed_paths, opt, seed_init_mode):
     seed_paths = []
     for view in views:
-        seed_path = getattr(view, "seed_points_path", None)
+        seed_path = _get_view_seed_path(view, seed_init_mode)
         if not seed_path or seed_path in seen_seed_paths:
             continue
         seen_seed_paths.add(seed_path)
@@ -140,6 +167,18 @@ def _append_online_seed_geometry(triangles, views, seen_seed_paths, opt):
 
     if not seed_paths:
         return 0
+
+    if seed_init_mode == "mesh_triangle":
+        seed_triangle_soup = _merge_triangle_soups([fetchTriangleSoup(seed_path) for seed_path in seed_paths])
+        if seed_triangle_soup is None:
+            return 0
+
+        return triangles.append_from_triangle_soup(
+            seed_triangle_soup[0],
+            seed_triangle_soup[1],
+            opacity=opt.set_opacity,
+            set_sigma=opt.set_sigma,
+        )
 
     seed_point_cloud = _merge_point_clouds([fetchPly(seed_path) for seed_path in seed_paths])
     if seed_point_cloud is None:
@@ -173,6 +212,10 @@ def run_training(
     rerun_logger = RerunLogger(run_config.rerun_app_id, create_rerun_config(dataset))
 
     try:
+        seed_init_mode = getattr(dataset, "seed_init_mode", "point")
+        if seed_init_mode == "mesh_triangle" and opt.nb_points != 3:
+            raise ValueError("seed_init_mode=mesh_triangle requires --nb_points 3")
+
         triangles = TriangleModel(dataset.sh_degree)
         scene = Scene(
             dataset,
@@ -206,9 +249,9 @@ def run_training(
         seen_online_seed_paths = set()
         if run_config.online_train:
             seen_online_seed_paths = {
-                view.seed_points_path
+                _get_view_seed_path(view, seed_init_mode)
                 for view in scene.getRevealedTrainCameras()
-                if getattr(view, "seed_points_path", None)
+                if _get_view_seed_path(view, seed_init_mode)
             }
         active_train_count = scene.getActiveTrainCameraCount()
 
@@ -261,6 +304,7 @@ def run_training(
                     newly_revealed_views,
                     seen_online_seed_paths,
                     opt,
+                    seed_init_mode,
                 )
                 active_train_count = scene.getActiveTrainCameraCount()
                 viewpoint_stack = scene.getTrainCameras().copy()
