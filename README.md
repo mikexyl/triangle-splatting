@@ -99,6 +99,7 @@ The same vicon-room baseline is available through Pixi tasks:
 pixi run kimera-sfm-vicon-room-1-dry-run
 pixi run kimera-sfm-vicon-room-1
 pixi run visualize-kimera-sfm-vicon-room-1
+pixi run visualize-seed-triangles-vicon-room-1
 pixi run train-kimera-sfm-vicon-room-1
 ```
 
@@ -127,8 +128,19 @@ Use `--mesh-triangle-merge-mode concat` to preserve the previous unreduced behav
 
 ```bash
 pixi run prepare-kimera-mesh-vicon-room-1-reduced
+pixi run visualize-seed-triangles-vicon-room-1
 pixi run train-kimera-mesh-vicon-room-1-reduced-2500
 ```
+
+The seed-triangle visualization writes `output/vicon_room_1_seed_triangle_soups/seed_triangle_soups.rrd` and a matching JSON summary. It logs the reduced Kimera mesh triangles directly and synthesizes the SfM point-seed triangles with the same nearest-neighbor sizing rule used by point initialization; SfM triangle rotations are deterministic in the export for repeatable visual comparisons.
+
+To separate camera/image alignment from seed geometry, run the four-cell Vicon room ablation:
+
+```bash
+pixi run ablate-vicon-room-1-seeds-2500
+```
+
+This builds hybrid datasets under `output/vicon_room_1_seed_ablation_datasets/`, evaluates initial renders, trains the fixed-soup 2500-iteration cells, and writes `output/vicon_room_1_seed_ablation/summary.md`. The ablation includes SfM points, Kimera mesh upsampled points, and Kimera mesh triangle seeds under both Kimera and COLMAP camera/image pipelines where applicable.
 
 ## Rendering
 To render a scene, you can use the following command:

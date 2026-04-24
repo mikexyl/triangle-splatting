@@ -7,8 +7,9 @@ Top-level scripts drive the main workflow: `train.py`, `render.py`, `metrics.py`
 Create the environment with `micromamba create -f requirements.yaml` (Python 3.11, CUDA 12.6). Build the rasterizer with `bash compile.sh`, then install KNN with `cd submodules/simple-knn && pip install .`. Main workflows:
 
 - Put training, rendering, metric, and evaluation outputs under `output/` by default, for example `-m output/<run_name>`. Use `/tmp` only for explicitly temporary scratch runs.
-- `pixi run colmap-help`, `pixi run kimera-sfm-vicon-room-1`, `pixi run visualize-kimera-sfm-vicon-room-1`, and `pixi run train-kimera-sfm-vicon-room-1` cover the Pixi COLMAP check, Kimera-pose SfM dataset generation, Rerun visualization, and baseline training workflow.
+- `pixi run colmap-help`, `pixi run kimera-sfm-vicon-room-1`, `pixi run visualize-kimera-sfm-vicon-room-1`, `pixi run visualize-seed-triangles-vicon-room-1`, and `pixi run train-kimera-sfm-vicon-room-1` cover the Pixi COLMAP check, Kimera-pose SfM dataset generation, Rerun visualization, seed triangle soup comparison, and baseline training workflow.
 - `pixi run prepare-kimera-mesh-vicon-room-1-reduced` builds the reduced texture-initialized Kimera mesh triangle dataset using centroid-voxel merging to avoid repeated triangles from overlapping per-frame meshes; `pixi run train-kimera-mesh-vicon-room-1-reduced-2500` runs the matching fixed-soup smoke ablation.
+- `pixi run ablate-vicon-room-1-seeds-2500` runs the four-cell Kimera/COLMAP camera-vs-seed ablation and writes the consolidated report under `output/vicon_room_1_seed_ablation/`.
 - `python train.py -s <scene_dir> -m output/<run_name> --eval` trains a model.
 - `python train.py -s <scene_dir> -m output/<run_name> --outdoor --eval` uses outdoor settings.
 - `python render.py -m <model_dir>` renders train/test views.
