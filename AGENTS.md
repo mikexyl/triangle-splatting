@@ -1,12 +1,14 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-Top-level scripts drive the main workflow: `train.py`, `render.py`, `metrics.py`, `full_eval.py`, `train_game_engine.py`, `create_video.py`, and `create_off.py`. Core logic lives in `scene/`, `triangle_renderer/`, and `utils/`; CLI argument groups are defined in `arguments/`. Native dependencies are vendored in `submodules/` (`diff-triangle-rasterization`, `simple-knn`). Benchmark helpers live under `scripts/eval_dtu/` and `scripts/eval_tnt/`, while `bash_scripts/` contains Slurm batch wrappers for full-scene evaluation. Keep large checkpoints, datasets, and rendered outputs out of Git.
+Top-level scripts drive the main workflow: `train.py`, `render.py`, `metrics.py`, `full_eval.py`, `train_game_engine.py`, `create_video.py`, and `create_off.py`. Core logic lives in `scene/`, `triangle_renderer/`, and `utils/`; CLI argument groups are defined in `arguments/`. Native dependencies are vendored in `submodules/` (`diff-triangle-rasterization`, `simple-knn`); COLMAP is provided by Pixi for SfM ablations. Benchmark helpers live under `scripts/eval_dtu/` and `scripts/eval_tnt/`, while `bash_scripts/` contains Slurm batch wrappers for full-scene evaluation. Keep large checkpoints, datasets, and rendered outputs out of Git.
 
 ## Build, Test, and Development Commands
 Create the environment with `micromamba create -f requirements.yaml` (Python 3.11, CUDA 12.6). Build the rasterizer with `bash compile.sh`, then install KNN with `cd submodules/simple-knn && pip install .`. Main workflows:
 
 - Put training, rendering, metric, and evaluation outputs under `output/` by default, for example `-m output/<run_name>`. Use `/tmp` only for explicitly temporary scratch runs.
+- `pixi run colmap-help`, `pixi run kimera-sfm-vicon-room-1`, `pixi run visualize-kimera-sfm-vicon-room-1`, and `pixi run train-kimera-sfm-vicon-room-1` cover the Pixi COLMAP check, Kimera-pose SfM dataset generation, Rerun visualization, and baseline training workflow.
+- `pixi run prepare-kimera-mesh-vicon-room-1-reduced` builds the reduced texture-initialized Kimera mesh triangle dataset using centroid-voxel merging to avoid repeated triangles from overlapping per-frame meshes; `pixi run train-kimera-mesh-vicon-room-1-reduced-2500` runs the matching fixed-soup smoke ablation.
 - `python train.py -s <scene_dir> -m output/<run_name> --eval` trains a model.
 - `python train.py -s <scene_dir> -m output/<run_name> --outdoor --eval` uses outdoor settings.
 - `python render.py -m <model_dir>` renders train/test views.

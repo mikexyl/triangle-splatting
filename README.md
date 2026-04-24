@@ -49,6 +49,13 @@ cd submodules/simple-knn
 pip install .
 ```
 
+COLMAP is available through the Pixi environment for SfM initialization ablations:
+
+```bash
+pixi install
+pixi run colmap-help
+```
+
 ## Training
 To train our model, you can use the following command:
 ```bash
@@ -58,6 +65,69 @@ python train.py -s <path_to_scenes> -m <output_model_path> --eval
 If you want to train the model on outdoor scenes, you should add the following command:  
 ```bash
 python train.py -s <path_to_scenes> -m <output_model_path> --outdoor --eval
+```
+
+## SfM Initialization Ablation
+
+The Kimera/COLMAP SfM ablation uses raw Kimera images and Kimera camera poses to seed COLMAP, triangulates a sparse point cloud, undistorts the reconstruction into the standard COLMAP dataset layout, and trains triangle splatting from the existing point-cloud initializer.
+
+```bash
+python scripts/run_kimera_pose_colmap_sfm.py \
+  --capture-dir /home/mikexyl/workspaces/kimera_ros2_ws/artifacts/vicon_room_1 \
+  --mav0-dir /data/euroc/V1_01_easy_raw/mav0 \
+  --camera cam0 \
+  --matcher sequential \
+  --output-dir output/vicon_room_1_kimera_pose_colmap_sfm \
+  --copy-images \
+  --no-gpu \
+  --overwrite
+```
+
+Then run the generated training command, or invoke it directly:
+
+```bash
+python train.py \
+  -s output/vicon_room_1_kimera_pose_colmap_sfm/dataset \
+  -m output/vicon_room_1_kimera_pose_colmap_sfm/train \
+  --eval \
+  --seed_init_mode point
+```
+
+The same vicon-room baseline is available through Pixi tasks:
+
+```bash
+pixi run kimera-sfm-vicon-room-1-dry-run
+pixi run kimera-sfm-vicon-room-1
+pixi run visualize-kimera-sfm-vicon-room-1
+pixi run train-kimera-sfm-vicon-room-1
+```
+
+All generated COLMAP databases, sparse models, undistorted datasets, summaries, and training outputs should stay under `output/`.
+
+## Kimera Mesh Triangle Initialization
+
+Kimera publishes overlapping per-frame meshes, so blindly concatenating every mesh snapshot can create many repeated initial triangles. The dataset converter can reduce the offline triangle soup with centroid-voxel merging while averaging overlapping texture colors:
+
+```bash
+python scripts/prepare_kimera_capture_dataset.py \
+  --capture-dir /home/mikexyl/workspaces/kimera_ros2_ws/artifacts/vicon_room_1 \
+  --mav0-dir /data/euroc/V1_01_easy_raw/mav0 \
+  --camera cam0 \
+  --output-dir output/vicon_room_1_texture_triangle_dataset_reduced \
+  --mesh-voxel-size 0.05 \
+  --mesh-sample-spacing 0.05 \
+  --mesh-triangle-max-edge 0.25 \
+  --mesh-triangle-max-count 50000 \
+  --mesh-triangle-color-source texture \
+  --mesh-triangle-merge-mode voxel \
+  --mesh-triangle-merge-voxel-size 0.05
+```
+
+Use `--mesh-triangle-merge-mode concat` to preserve the previous unreduced behavior. The vicon-room reduced mesh workflow is also available through Pixi:
+
+```bash
+pixi run prepare-kimera-mesh-vicon-room-1-reduced
+pixi run train-kimera-mesh-vicon-room-1-reduced-2500
 ```
 
 ## Rendering

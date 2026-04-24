@@ -32,6 +32,16 @@ class CameraCalibration:
         )
 
 
+@dataclass
+class MeshGeometry:
+    vertices: np.ndarray
+    faces: np.ndarray
+    texcoords: np.ndarray
+    face_texcoords: np.ndarray
+    vertex_colors: np.ndarray
+    texture_path: Path | None
+
+
 def _quaternion_to_matrix(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
     norm = np.linalg.norm([qw, qx, qy, qz])
     if norm == 0.0:
@@ -176,53 +186,140 @@ def _undistort_image(
         raise RuntimeError(f"Failed to write undistorted image: {output_path}")
 
 
-def _parse_obj_vertex_index(token: str, vertex_count: int) -> int:
-    index_token = token.split("/", maxsplit=1)[0]
+def _parse_obj_index(index_token: str, value_count: int, value_name: str) -> int:
     if not index_token:
-        raise ValueError("Missing vertex index")
+        raise ValueError(f"Missing {value_name} index")
 
     index = int(index_token)
     if index < 0:
-        index = vertex_count + index
+        index = value_count + index
     else:
         index -= 1
 
-    if index < 0 or index >= vertex_count:
-        raise ValueError(f"Vertex index {index + 1} is out of range for mesh with {vertex_count} vertices")
+    if index < 0 or index >= value_count:
+        raise ValueError(f"{value_name} index {index + 1} is out of range for mesh with {value_count} {value_name}s")
     return index
 
 
-def _load_mesh_geometry(mesh_path: Path) -> tuple[np.ndarray, np.ndarray]:
+def _parse_obj_face_token(token: str, vertex_count: int, texcoord_count: int) -> tuple[int, int]:
+    parts = token.split("/")
+    vertex_index = _parse_obj_index(parts[0], vertex_count, "vertex")
+    texcoord_index = -1
+    if len(parts) > 1 and parts[1]:
+        texcoord_index = _parse_obj_index(parts[1], texcoord_count, "texture coordinate")
+    return vertex_index, texcoord_index
+
+
+def _load_texture_from_mtl(mtl_path: Path) -> Path | None:
+    if not mtl_path.exists():
+        return None
+
+    with mtl_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = stripped.split()
+            if parts[0] != "map_Kd" or len(parts) < 2:
+                continue
+            return (mtl_path.parent / parts[-1]).resolve()
+    return None
+
+
+def _resolve_obj_texture_path(mesh_path: Path, mtl_filenames: list[str], texture_filename: str | None) -> Path | None:
+    if texture_filename:
+        texture_path = mesh_path.parent / texture_filename
+        if texture_path.exists():
+            return texture_path.resolve()
+
+    for mtl_filename in mtl_filenames:
+        texture_path = _load_texture_from_mtl(mesh_path.parent / mtl_filename)
+        if texture_path is not None and texture_path.exists():
+            return texture_path
+    return None
+
+
+def _load_mesh_geometry(mesh_path: Path, texture_filename: str | None = None) -> MeshGeometry:
     vertices = []
+    vertex_colors = []
+    has_vertex_colors = False
+    texcoords = []
     faces = []
+    face_texcoords = []
+    mtl_filenames = []
     with mesh_path.open("r", encoding="utf-8") as handle:
         for line in handle:
-            if line.startswith("v "):
-                parts = line.split()
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+
+            if stripped.startswith("mtllib "):
+                mtl_filenames.extend(stripped.split()[1:])
+                continue
+
+            if stripped.startswith("v "):
+                parts = stripped.split()
                 if len(parts) < 4:
                     continue
                 vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
+                if len(parts) >= 7:
+                    vertex_colors.append([float(parts[4]), float(parts[5]), float(parts[6])])
+                    has_vertex_colors = True
+                else:
+                    vertex_colors.append([np.nan, np.nan, np.nan])
                 continue
 
-            if not line.startswith("f "):
+            if stripped.startswith("vt "):
+                parts = stripped.split()
+                if len(parts) >= 3:
+                    texcoords.append([float(parts[1]), float(parts[2])])
                 continue
 
-            parts = line.split()[1:]
+            if not stripped.startswith("f "):
+                continue
+
+            parts = stripped.split()[1:]
             if len(parts) < 3:
                 continue
 
             try:
-                polygon = [_parse_obj_vertex_index(part, len(vertices)) for part in parts]
+                polygon = [_parse_obj_face_token(part, len(vertices), len(texcoords)) for part in parts]
             except ValueError:
                 continue
 
             # OBJ faces may be quads or ngons; triangulate with a simple fan.
             for idx in range(1, len(polygon) - 1):
-                faces.append([polygon[0], polygon[idx], polygon[idx + 1]])
+                face = [polygon[0], polygon[idx], polygon[idx + 1]]
+                faces.append([face_vertex[0] for face_vertex in face])
+                face_texcoords.append([face_vertex[1] for face_vertex in face])
 
     vertices_array = np.asarray(vertices, dtype=np.float32) if vertices else np.empty((0, 3), dtype=np.float32)
     faces_array = np.asarray(faces, dtype=np.int32) if faces else np.empty((0, 3), dtype=np.int32)
-    return vertices_array, faces_array
+    texcoords_array = np.asarray(texcoords, dtype=np.float32) if texcoords else np.empty((0, 2), dtype=np.float32)
+    face_texcoords_array = (
+        np.asarray(face_texcoords, dtype=np.int32)
+        if face_texcoords
+        else np.empty((0, 3), dtype=np.int32)
+    )
+
+    vertex_colors_array = np.empty((0, 3), dtype=np.float32)
+    if has_vertex_colors and len(vertex_colors) == len(vertices):
+        vertex_colors_array = np.asarray(vertex_colors, dtype=np.float32)
+        if not np.isnan(vertex_colors_array).any():
+            if vertex_colors_array.size and float(vertex_colors_array.max()) > 1.0:
+                vertex_colors_array = vertex_colors_array / 255.0
+            vertex_colors_array = np.clip(vertex_colors_array, 0.0, 1.0).astype(np.float32, copy=False)
+        else:
+            vertex_colors_array = np.empty((0, 3), dtype=np.float32)
+
+    return MeshGeometry(
+        vertices=vertices_array,
+        faces=faces_array,
+        texcoords=texcoords_array,
+        face_texcoords=face_texcoords_array,
+        vertex_colors=vertex_colors_array,
+        texture_path=_resolve_obj_texture_path(mesh_path, mtl_filenames, texture_filename),
+    )
 
 
 def _sample_mesh_surface_points(
@@ -295,13 +392,26 @@ def _subdivide_triangles_by_max_edge(
     triangles: np.ndarray,
     max_edge: float,
     max_count: int,
-) -> tuple[np.ndarray, bool]:
+    vertex_attributes: list[np.ndarray | None] | None = None,
+) -> tuple[np.ndarray, list[np.ndarray | None], bool]:
+    vertex_attributes = vertex_attributes or []
+
+    def truncate_attributes(count: int) -> list[np.ndarray | None]:
+        return [
+            None if attribute is None else attribute[:count].astype(np.float32, copy=False)
+            for attribute in vertex_attributes
+        ]
+
     if len(triangles) == 0 or max_edge <= 0.0:
         if max_count > 0 and len(triangles) > max_count:
-            return triangles[:max_count].astype(np.float32, copy=False), True
-        return triangles.astype(np.float32, copy=False), False
+            return triangles[:max_count].astype(np.float32, copy=False), truncate_attributes(max_count), True
+        return triangles.astype(np.float32, copy=False), truncate_attributes(len(triangles)), False
 
     triangles = triangles.astype(np.float32, copy=False)
+    vertex_attributes = [
+        None if attribute is None else attribute.astype(np.float32, copy=False)
+        for attribute in vertex_attributes
+    ]
     cap_reached = False
     while True:
         max_edges = _triangle_max_edges(triangles)
@@ -325,23 +435,115 @@ def _subdivide_triangles_by_max_edge(
 
         keep_mask = np.ones(len(triangles), dtype=bool)
         keep_mask[selected_indices] = False
+        split_triangles = _split_triangles_once(triangles[selected_indices])
         triangles = np.concatenate(
-            [triangles[keep_mask], _split_triangles_once(triangles[selected_indices])],
+            [triangles[keep_mask], split_triangles],
             axis=0,
         )
+        vertex_attributes = [
+            None
+            if attribute is None
+            else np.concatenate([attribute[keep_mask], _split_triangles_once(attribute[selected_indices])], axis=0)
+            for attribute in vertex_attributes
+        ]
 
         if cap_reached:
             break
 
-    return triangles.astype(np.float32, copy=False), cap_reached
+    return triangles.astype(np.float32, copy=False), vertex_attributes, cap_reached
 
 
-def _write_triangle_soup_npz(output_path: Path, triangles: np.ndarray) -> None:
-    colors = np.full((len(triangles), 3), 180.0 / 255.0, dtype=np.float32)
+def _load_texture_image(texture_path: Path | None) -> np.ndarray | None:
+    if texture_path is None or not texture_path.exists():
+        return None
+
+    image = cv2.imread(str(texture_path), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        return None
+
+    if image.ndim == 2:
+        image = np.repeat(image[:, :, None], 3, axis=2)
+    elif image.shape[2] == 4:
+        image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+    elif image.shape[2] == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    else:
+        return None
+
+    image = image.astype(np.float32)
+    max_value = float(image.max()) if image.size else 1.0
+    if max_value > 1.0:
+        image /= 255.0 if max_value <= 255.0 else max_value
+    return np.clip(image, 0.0, 1.0)
+
+
+def _sample_texture_bilinear(texture: np.ndarray, uvs: np.ndarray) -> np.ndarray:
+    height, width = texture.shape[:2]
+    u = np.clip(uvs[:, 0], 0.0, 1.0)
+    v = np.clip(uvs[:, 1], 0.0, 1.0)
+
+    x = u * (width - 1)
+    # Kimera writes normalized image coordinates for these textures, so v=0 is
+    # the top image row rather than the usual OBJ bottom-left convention.
+    y = v * (height - 1)
+
+    x0 = np.floor(x).astype(np.int32)
+    y0 = np.floor(y).astype(np.int32)
+    x1 = np.minimum(x0 + 1, width - 1)
+    y1 = np.minimum(y0 + 1, height - 1)
+
+    wx = (x - x0)[:, None]
+    wy = (y - y0)[:, None]
+
+    top = texture[y0, x0] * (1.0 - wx) + texture[y0, x1] * wx
+    bottom = texture[y1, x0] * (1.0 - wx) + texture[y1, x1] * wx
+    return (top * (1.0 - wy) + bottom * wy).astype(np.float32, copy=False)
+
+
+def _triangle_seed_colors(
+    triangle_count: int,
+    uv_triangles: np.ndarray | None,
+    texture: np.ndarray | None,
+    vertex_color_triangles: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    colors = np.full((triangle_count, 3), 180.0 / 255.0, dtype=np.float32)
+    texture_mask = np.zeros((triangle_count,), dtype=bool)
+    source = "neutral_gray"
+
+    if texture is not None and uv_triangles is not None and len(uv_triangles) == triangle_count:
+        finite_uv_mask = np.isfinite(uv_triangles).all(axis=(1, 2))
+        if np.any(finite_uv_mask):
+            centroid_uvs = uv_triangles[finite_uv_mask].mean(axis=1)
+            colors[finite_uv_mask] = _sample_texture_bilinear(texture, centroid_uvs)
+            texture_mask[finite_uv_mask] = True
+            source = "texture"
+
+    if not np.all(texture_mask) and vertex_color_triangles is not None and len(vertex_color_triangles) == triangle_count:
+        finite_color_mask = np.isfinite(vertex_color_triangles).all(axis=(1, 2))
+        if np.any(texture_mask):
+            finite_color_mask &= ~np.isfinite(uv_triangles).all(axis=(1, 2))
+        if np.any(finite_color_mask):
+            colors[finite_color_mask] = np.clip(vertex_color_triangles[finite_color_mask].mean(axis=1), 0.0, 1.0)
+            source = "texture_and_vertex_color" if np.any(texture_mask) else "vertex_color"
+
+    return colors, texture_mask, source
+
+
+def _write_triangle_soup_npz(output_path: Path, triangles: np.ndarray, colors: np.ndarray | None = None) -> None:
+    if colors is None:
+        colors = np.full((len(triangles), 3), 180.0 / 255.0, dtype=np.float32)
+    else:
+        colors = np.asarray(colors, dtype=np.float32)
+        if colors.shape != (len(triangles), 3):
+            raise ValueError(f"Triangle colors must have shape {(len(triangles), 3)}, got {colors.shape}")
+        if colors.size and colors.max() > 1.0:
+            colors = colors / 255.0
+        colors = np.clip(colors, 0.0, 1.0)
+
     np.savez_compressed(
         output_path,
         triangles=triangles.astype(np.float32, copy=False),
-        colors=colors,
+        colors=colors.astype(np.float32, copy=False),
     )
 
 
@@ -387,6 +589,90 @@ def _downsample_points(points: np.ndarray, voxel_size: float) -> np.ndarray:
     return points[np.sort(unique_indices)]
 
 
+def _triangle_reduction_summary(
+    mode: str,
+    input_count: int,
+    output_count: int,
+    voxel_size: float,
+    normal_bins: int,
+) -> dict[str, object]:
+    return {
+        "mode": mode,
+        "input_triangle_count": int(input_count),
+        "output_triangle_count": int(output_count),
+        "removed_triangle_count": int(max(input_count - output_count, 0)),
+        "voxel_size": float(voxel_size) if mode == "voxel" else 0.0,
+        "normal_bins": int(normal_bins) if mode == "voxel" else 0,
+    }
+
+
+def _triangle_normals(triangles: np.ndarray) -> np.ndarray:
+    normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+    norm = np.linalg.norm(normals, axis=1, keepdims=True)
+    return normals / np.maximum(norm, 1e-12)
+
+
+def _reduce_triangle_soup(
+    triangles: np.ndarray,
+    colors: np.ndarray,
+    texture_mask: np.ndarray,
+    mode: str,
+    voxel_size: float,
+    normal_bins: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
+    input_count = int(len(triangles))
+    if input_count == 0 or mode == "concat" or voxel_size <= 0.0:
+        return (
+            triangles.astype(np.float32, copy=False),
+            colors.astype(np.float32, copy=False),
+            texture_mask.astype(bool, copy=False),
+            _triangle_reduction_summary("concat", input_count, input_count, 0.0, 0),
+        )
+
+    centroids = triangles.mean(axis=1)
+    keys = [np.floor(centroids / voxel_size).astype(np.int64)]
+    if normal_bins > 0:
+        normals = np.clip(_triangle_normals(triangles), -1.0, 1.0)
+        normal_keys = np.floor((normals + 1.0) * normal_bins).astype(np.int64)
+        normal_keys = np.clip(normal_keys, 0, normal_bins * 2 - 1)
+        keys.append(normal_keys)
+    voxel_keys = np.concatenate(keys, axis=1)
+
+    _, first_indices, inverse = np.unique(voxel_keys, axis=0, return_index=True, return_inverse=True)
+    group_count = len(first_indices)
+    counts = np.bincount(inverse, minlength=group_count).astype(np.float32)
+
+    color_sums = np.zeros((group_count, 3), dtype=np.float64)
+    np.add.at(color_sums, inverse, colors.astype(np.float64, copy=False))
+    reduced_colors = color_sums / np.maximum(counts[:, None], 1.0)
+
+    if texture_mask.size:
+        texture_weights = texture_mask.astype(np.float32, copy=False)
+        texture_counts = np.bincount(inverse, weights=texture_weights, minlength=group_count).astype(np.float32)
+        texture_color_sums = np.zeros((group_count, 3), dtype=np.float64)
+        np.add.at(texture_color_sums, inverse, colors.astype(np.float64, copy=False) * texture_weights[:, None])
+        textured_groups = texture_counts > 0.0
+        reduced_colors[textured_groups] = (
+            texture_color_sums[textured_groups] / texture_counts[textured_groups, None]
+        )
+        reduced_texture_mask = textured_groups
+    else:
+        reduced_texture_mask = np.zeros((group_count,), dtype=bool)
+
+    # np.unique sorts by key. Restore first-observation order so the reduced soup
+    # remains stable with respect to the original mesh timeline.
+    output_order = np.argsort(first_indices)
+    reduced_triangles = triangles[first_indices][output_order].astype(np.float32, copy=False)
+    reduced_colors = np.clip(reduced_colors[output_order], 0.0, 1.0).astype(np.float32, copy=False)
+    reduced_texture_mask = reduced_texture_mask[output_order].astype(bool, copy=False)
+    return (
+        reduced_triangles,
+        reduced_colors,
+        reduced_texture_mask,
+        _triangle_reduction_summary(mode, input_count, len(reduced_triangles), voxel_size, normal_bins),
+    )
+
+
 def _build_mesh_seed_entries(
     capture_dir: Path,
     output_dir: Path,
@@ -394,7 +680,18 @@ def _build_mesh_seed_entries(
     sample_spacing: float,
     triangle_max_edge: float,
     triangle_max_count: int,
-) -> tuple[list[dict[str, object]], dict[str, object], dict[str, object], np.ndarray, np.ndarray]:
+    triangle_color_source: str,
+    triangle_merge_mode: str,
+    triangle_merge_voxel_size: float,
+    triangle_merge_normal_bins: int,
+) -> tuple[list[dict[str, object]], dict[str, object], dict[str, object], np.ndarray, np.ndarray, np.ndarray]:
+    empty_reduction = _triangle_reduction_summary(
+        triangle_merge_mode,
+        0,
+        0,
+        triangle_merge_voxel_size,
+        triangle_merge_normal_bins,
+    )
     meshes_csv = capture_dir / "meshes.csv"
     if not meshes_csv.exists():
         return [], {
@@ -410,17 +707,25 @@ def _build_mesh_seed_entries(
             "cap_reached_file_count": 0,
             "max_edge": float(triangle_max_edge),
             "max_count": int(triangle_max_count),
-        }, np.empty((0, 3), dtype=np.float32), np.empty((0, 3, 3), dtype=np.float32)
+            "textured_triangle_count": 0,
+            "texture_seed_file_count": 0,
+            "color_source": triangle_color_source,
+            "reduction": empty_reduction,
+        }, np.empty((0, 3), dtype=np.float32), np.empty((0, 3, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32)
 
     all_points = []
     all_triangles = []
+    all_triangle_colors = []
+    all_triangle_texture_masks = []
     mesh_seed_entries = []
     mesh_count = 0
     total_vertex_count = 0
     total_face_count = 0
     total_sampled_point_count = 0
     total_output_triangle_count = 0
+    total_textured_triangle_count = 0
     triangle_seed_file_count = 0
+    texture_seed_file_count = 0
     triangle_cap_reached_file_count = 0
     effective_sample_spacing = sample_spacing
     if effective_sample_spacing <= 0.0:
@@ -438,24 +743,54 @@ def _build_mesh_seed_entries(
         mesh_path = capture_dir / "meshes" / obj_filename
         if not mesh_path.exists():
             continue
-        vertices, faces = _load_mesh_geometry(mesh_path)
+        mesh = _load_mesh_geometry(mesh_path, row.get("texture_filename", "").strip() or None)
+        vertices = mesh.vertices
+        faces = mesh.faces
         if len(vertices) == 0:
             continue
 
         triangle_seed_rel_path = None
         triangle_count = 0
+        textured_triangle_count = 0
         triangle_cap_reached = False
+        color_source = None
         if len(faces) > 0:
             mesh_triangles = vertices[faces]
-            mesh_triangles, triangle_cap_reached = _subdivide_triangles_by_max_edge(
+            uv_triangles = None
+            if len(mesh.texcoords) > 0 and mesh.face_texcoords.shape == faces.shape:
+                uv_triangles = np.full((len(faces), 3, 2), np.nan, dtype=np.float32)
+                valid_uv_mask = mesh.face_texcoords >= 0
+                if np.any(valid_uv_mask):
+                    uv_triangles[valid_uv_mask] = mesh.texcoords[mesh.face_texcoords[valid_uv_mask]]
+
+            vertex_color_triangles = None
+            if triangle_color_source in ("texture", "vertex") and len(mesh.vertex_colors) == len(vertices):
+                vertex_color_triangles = mesh.vertex_colors[faces]
+
+            mesh_triangles, subdivided_attributes, triangle_cap_reached = _subdivide_triangles_by_max_edge(
                 mesh_triangles,
                 max_edge=triangle_max_edge,
                 max_count=triangle_max_count,
+                vertex_attributes=[uv_triangles, vertex_color_triangles],
             )
+            uv_triangles, vertex_color_triangles = subdivided_attributes
             if len(mesh_triangles) > 0:
+                texture = _load_texture_image(mesh.texture_path) if triangle_color_source == "texture" else None
+                if triangle_color_source == "gray":
+                    vertex_color_triangles = None
+                triangle_colors, triangle_texture_mask, color_source = _triangle_seed_colors(
+                    len(mesh_triangles),
+                    uv_triangles,
+                    texture,
+                    vertex_color_triangles,
+                )
+                textured_triangle_count = int(triangle_texture_mask.sum())
                 triangle_seed_file_count += 1
+                if textured_triangle_count > 0:
+                    texture_seed_file_count += 1
                 triangle_count = int(len(mesh_triangles))
                 total_output_triangle_count += triangle_count
+                total_textured_triangle_count += textured_triangle_count
                 if triangle_cap_reached:
                     triangle_cap_reached_file_count += 1
                     cap_reason = (
@@ -468,8 +803,10 @@ def _build_mesh_seed_entries(
                         f"wrote {triangle_count} triangles {cap_reason}."
                     )
                 all_triangles.append(mesh_triangles)
+                all_triangle_colors.append(triangle_colors)
+                all_triangle_texture_masks.append(triangle_texture_mask)
                 triangle_seed_rel_path = f"mesh_seed_triangles/{Path(obj_filename).stem}.npz"
-                _write_triangle_soup_npz(output_dir / triangle_seed_rel_path, mesh_triangles)
+                _write_triangle_soup_npz(output_dir / triangle_seed_rel_path, mesh_triangles, triangle_colors)
 
         surface_points = _sample_mesh_surface_points(vertices, faces, effective_sample_spacing, rng)
         mesh_points = np.concatenate([vertices, surface_points], axis=0) if len(surface_points) else vertices
@@ -492,7 +829,11 @@ def _build_mesh_seed_entries(
                 "triangle_seed_rel_path": triangle_seed_rel_path,
                 "point_count": int(len(mesh_points)),
                 "triangle_count": triangle_count,
+                "textured_triangle_count": textured_triangle_count,
                 "triangle_cap_reached": triangle_cap_reached,
+                "texture_filename": row.get("texture_filename", "").strip() or None,
+                "texture_path": str(mesh.texture_path) if mesh.texture_path else None,
+                "triangle_color_source": color_source if triangle_count > 0 else None,
                 "obj_filename": obj_filename,
             }
         )
@@ -511,13 +852,35 @@ def _build_mesh_seed_entries(
             "cap_reached_file_count": triangle_cap_reached_file_count,
             "max_edge": float(triangle_max_edge),
             "max_count": int(triangle_max_count),
-        }, np.empty((0, 3), dtype=np.float32), np.empty((0, 3, 3), dtype=np.float32)
+            "textured_triangle_count": total_textured_triangle_count,
+            "texture_seed_file_count": texture_seed_file_count,
+            "color_source": triangle_color_source,
+            "reduction": empty_reduction,
+        }, np.empty((0, 3), dtype=np.float32), np.empty((0, 3, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32)
 
     points = _downsample_points(np.concatenate(all_points, axis=0), voxel_size)
     triangles = (
         np.concatenate(all_triangles, axis=0)
         if all_triangles
         else np.empty((0, 3, 3), dtype=np.float32)
+    )
+    triangle_colors = (
+        np.concatenate(all_triangle_colors, axis=0)
+        if all_triangle_colors
+        else np.empty((0, 3), dtype=np.float32)
+    )
+    triangle_texture_mask = (
+        np.concatenate(all_triangle_texture_masks, axis=0)
+        if all_triangle_texture_masks
+        else np.empty((0,), dtype=bool)
+    )
+    triangles, triangle_colors, triangle_texture_mask, triangle_reduction_stats = _reduce_triangle_soup(
+        triangles,
+        triangle_colors,
+        triangle_texture_mask,
+        mode=triangle_merge_mode,
+        voxel_size=triangle_merge_voxel_size,
+        normal_bins=triangle_merge_normal_bins,
     )
     mesh_seed_entries.sort(key=lambda entry: entry["time_ns"])
     return mesh_seed_entries, {
@@ -531,10 +894,16 @@ def _build_mesh_seed_entries(
     }, {
         "mesh_seed_file_count": triangle_seed_file_count,
         "output_triangle_count": int(len(triangles)),
+        "per_frame_triangle_count": int(total_output_triangle_count),
         "cap_reached_file_count": triangle_cap_reached_file_count,
         "max_edge": float(triangle_max_edge),
         "max_count": int(triangle_max_count),
-    }, points, triangles
+        "textured_triangle_count": int(triangle_texture_mask.sum()),
+        "per_frame_textured_triangle_count": int(total_textured_triangle_count),
+        "texture_seed_file_count": int(texture_seed_file_count),
+        "color_source": triangle_color_source,
+        "reduction": triangle_reduction_stats,
+    }, points, triangles, triangle_colors
 
 
 def _select_mesh_seed_entry(frame_time_ns: int, mesh_seed_entries: list[dict[str, object]]) -> dict[str, object] | None:
@@ -604,6 +973,30 @@ def main() -> None:
         default=500000,
         help="Maximum triangles to write per mesh seed after subdivision; <=0 disables the cap.",
     )
+    parser.add_argument(
+        "--mesh-triangle-color-source",
+        choices=["texture", "vertex", "gray"],
+        default="texture",
+        help="Appearance initialization for mesh triangle seeds. texture samples OBJ UV textures, vertex uses OBJ vertex colors, and gray preserves the previous neutral initialization.",
+    )
+    parser.add_argument(
+        "--mesh-triangle-merge-mode",
+        choices=["concat", "voxel"],
+        default="concat",
+        help="How to build mesh_seed_triangles/all.npz from per-frame Kimera meshes. concat preserves all frame meshes; voxel merges overlapping frame meshes by triangle centroid.",
+    )
+    parser.add_argument(
+        "--mesh-triangle-merge-voxel-size",
+        type=float,
+        default=0.05,
+        help="Centroid voxel size in meters for --mesh-triangle-merge-mode voxel.",
+    )
+    parser.add_argument(
+        "--mesh-triangle-merge-normal-bins",
+        type=int,
+        default=0,
+        help="Optional normal-direction bins for voxel triangle merging. 0 merges by centroid only; larger values preserve more differently oriented triangles in the same voxel.",
+    )
     args = parser.parse_args()
 
     capture_dir = Path(args.capture_dir).expanduser().resolve()
@@ -634,18 +1027,33 @@ def main() -> None:
     new_fy = float(new_camera_matrix[1, 1])
     new_cx = float(new_camera_matrix[0, 2])
     new_cy = float(new_camera_matrix[1, 2])
-    mesh_seed_entries, point_cloud_stats, triangle_soup_stats, merged_seed_points, merged_seed_triangles = _build_mesh_seed_entries(
+    (
+        mesh_seed_entries,
+        point_cloud_stats,
+        triangle_soup_stats,
+        merged_seed_points,
+        merged_seed_triangles,
+        merged_seed_triangle_colors,
+    ) = _build_mesh_seed_entries(
         capture_dir,
         output_dir,
         voxel_size=args.mesh_voxel_size,
         sample_spacing=args.mesh_sample_spacing,
         triangle_max_edge=args.mesh_triangle_max_edge,
         triangle_max_count=args.mesh_triangle_max_count,
+        triangle_color_source=args.mesh_triangle_color_source,
+        triangle_merge_mode=args.mesh_triangle_merge_mode,
+        triangle_merge_voxel_size=args.mesh_triangle_merge_voxel_size,
+        triangle_merge_normal_bins=args.mesh_triangle_merge_normal_bins,
     )
     if len(merged_seed_points) > 0:
         _write_point_cloud_ply(output_dir / "points3d.ply", merged_seed_points)
     if len(merged_seed_triangles) > 0:
-        _write_triangle_soup_npz(output_dir / "mesh_seed_triangles" / "all.npz", merged_seed_triangles)
+        _write_triangle_soup_npz(
+            output_dir / "mesh_seed_triangles" / "all.npz",
+            merged_seed_triangles,
+            merged_seed_triangle_colors,
+        )
 
     transformed_frames = []
     for row in frame_rows:
