@@ -134,6 +134,29 @@ pixi run train-kimera-mesh-vicon-room-1-reduced-2500
 
 The seed-triangle visualization writes `output/vicon_room_1_seed_triangle_soups/seed_triangle_soups.rrd` and a matching JSON summary. It logs the reduced Kimera mesh triangles directly and synthesizes the SfM point-seed triangles with the same nearest-neighbor sizing rule used by point initialization; SfM triangle rotations are deterministic in the export for repeatable visual comparisons.
 
+For a seed-only check of coverage-aware adaptive mesh triangles, run:
+
+```bash
+pixi run prepare-kimera-mesh-vicon-room-1-coverage-adaptive
+pixi run visualize-kimera-mesh-vicon-room-1-coverage-adaptive
+```
+
+This writes `output/vicon_room_1_coverage_adaptive_mesh_seed/mesh_seed_triangles/all.npz` for trainer-compatible mesh-triangle initialization, plus `adaptive_mesh.npz` and `seed_stats.json` sidecars for inspection. The adaptive path coarsens low-texture planar Kimera mesh patches into larger triangles, keeps high-detail regions smaller, and reports projected mesh coverage while leaving uncovered image regions unseeded.
+
+For a Kimera-only fallback that does not require SfM, use the image-plane variant. It places bounded camera-facing proxy triangles in large uncovered image components using only Kimera poses, images, mesh coverage, and nearby mesh depth:
+
+```bash
+pixi run prepare-kimera-mesh-vicon-room-1-coverage-adaptive-image-fallback
+pixi run visualize-kimera-mesh-vicon-room-1-coverage-adaptive-image-fallback
+```
+
+An explicit SfM-fallback variant is kept for ablation only. It writes a separate output directory and appends bounded SfM fallback triangles where projected Kimera mesh coverage is missing:
+
+```bash
+pixi run prepare-kimera-mesh-vicon-room-1-coverage-adaptive-sfm-fallback
+pixi run visualize-kimera-mesh-vicon-room-1-coverage-adaptive-sfm-fallback
+```
+
 To separate camera/image alignment from seed geometry, run the four-cell Vicon room ablation:
 
 ```bash
