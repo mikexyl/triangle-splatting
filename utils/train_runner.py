@@ -42,6 +42,7 @@ ONLINE_TRAIN_ARG_NAMES = (
     "online_train_window_size",
     "online_train_min_prune_cameras",
     "online_train_unbounded",
+    "online_train_stop_when_frames_exhausted",
 )
 
 SEED_INIT_ARG_NAMES = (
@@ -59,6 +60,7 @@ class TrainingRunConfig:
     online_train_window_size: int = 0
     online_train_min_prune_cameras: int = 250
     online_train_unbounded: bool = False
+    online_train_stop_when_frames_exhausted: bool = False
 
 
 class _PyramidTrainingView:
@@ -157,6 +159,16 @@ def _ceil_div(numerator: int, denominator: int) -> int:
     return (numerator + denominator - 1) // denominator
 
 
+def _online_frame_exhaustion_iteration(scene, run_config, growth_interval: int) -> int:
+    growth_count = int(run_config.online_train_camera_growth_count)
+    total_count = scene.getTotalTrainCameraCount()
+    initial_count = min(int(run_config.online_train_initial_cameras), total_count)
+    remaining_count = max(0, total_count - initial_count)
+    reveal_steps = _ceil_div(remaining_count, growth_count) if remaining_count > 0 else 0
+    last_reveal_iteration = 1 + reveal_steps * growth_interval
+    return last_reveal_iteration + growth_interval - 1
+
+
 def _resolve_online_growth_schedule(scene, run_config, opt):
     requested_interval = int(run_config.online_train_camera_growth_interval)
     growth_count = int(run_config.online_train_camera_growth_count)
@@ -237,11 +249,11 @@ def add_online_training_args(parser) -> None:
     parser.add_argument(
         "--online_train_camera_growth_interval",
         type=int,
-        default=0,
+        default=10,
         help=(
             "Reveal more train cameras every N iterations during the primitive online replay. "
-            "Use 0 to reveal one new train camera per iteration in unbounded replay, or to auto-select "
-            "an interval that reaches all train cameras by the final iteration in bounded replay when possible."
+            "The default 10 gives 10 optimization iterations per newly revealed frame. Use 0 to auto-select "
+            "a cadence from the bounded run length, or one new frame per iteration in open-ended replay."
         ),
     )
     parser.add_argument(
@@ -265,7 +277,12 @@ def add_online_training_args(parser) -> None:
     parser.add_argument(
         "--online_train_unbounded",
         action="store_true",
-        help="Run primitive online replay without a final iteration cap; stop it manually when done.",
+        help="Run primitive online replay without a user-specified final iteration cap.",
+    )
+    parser.add_argument(
+        "--online_train_stop_when_frames_exhausted",
+        action="store_true",
+        help="For unbounded primitive online replay, stop after every train frame has been revealed and optimized for one growth interval.",
     )
 
 
@@ -363,6 +380,9 @@ def run_training(
         unbounded_online_train = run_config.online_train and (
             bool(getattr(run_config, "online_train_unbounded", False)) or int(opt.iterations) <= 0
         )
+        stop_when_frames_exhausted = unbounded_online_train and bool(
+            getattr(run_config, "online_train_stop_when_frames_exhausted", False)
+        )
         if not unbounded_online_train and int(opt.iterations) <= 0:
             raise ValueError("--iterations must be > 0 unless primitive online replay is unbounded")
 
@@ -412,6 +432,21 @@ def run_training(
                     "Warning: configured online train camera growth interval will reveal only "
                     f"{expected_final_count}/{scene.getTotalTrainCameraCount()} train cameras by iteration "
                     f"{int(opt.iterations)}. Use --online_train_camera_growth_interval 0 for automatic full-run coverage."
+                )
+            frame_exhaustion_iteration = None
+            if stop_when_frames_exhausted:
+                frame_exhaustion_iteration = _online_frame_exhaustion_iteration(
+                    scene,
+                    run_config,
+                    online_growth_interval,
+                )
+                testing_iterations = sorted(set(testing_iterations) | {frame_exhaustion_iteration})
+                save_iterations = sorted(set(save_iterations) | {frame_exhaustion_iteration})
+                print(
+                    "Online replay will stop when train frames are exhausted: "
+                    f"{scene.getTotalTrainCameraCount()} train frames, "
+                    f"{online_growth_interval} optimization iteration(s) per reveal step, "
+                    f"final iteration {frame_exhaustion_iteration}."
                 )
             print(
                 "Primitive online train replay enabled: "
@@ -472,13 +507,25 @@ def run_training(
             raise RuntimeError("Training requires at least one active train camera.")
 
         ema_loss_for_log = 0.0
+        effective_final_iteration = None
+        if stop_when_frames_exhausted:
+            effective_final_iteration = frame_exhaustion_iteration
+        elif not unbounded_online_train:
+            effective_final_iteration = int(opt.iterations)
+        open_ended_online_train = unbounded_online_train and effective_final_iteration is None
         progress_bar = (
             tqdm(total=None, initial=first_iter, desc="Training progress")
-            if unbounded_online_train
+            if open_ended_online_train
             else tqdm(range(first_iter, opt.iterations), desc="Training progress")
+            if effective_final_iteration is None
+            else tqdm(range(first_iter, effective_final_iteration), desc="Training progress")
         )
         start_iteration = first_iter + 1
-        iteration_range = count(start_iteration) if unbounded_online_train else range(start_iteration, opt.iterations + 1)
+        iteration_range = (
+            count(start_iteration)
+            if open_ended_online_train
+            else range(start_iteration, effective_final_iteration + 1)
+        )
 
         total_dead = 0
         opacity_now = True
@@ -630,7 +677,7 @@ def run_training(
                         postfix["Pyramid"] = pyramid_level
                     progress_bar.set_postfix(postfix)
                     progress_bar.update(10)
-                if not unbounded_online_train and iteration == opt.iterations:
+                if effective_final_iteration is not None and iteration == effective_final_iteration:
                     progress_bar.close()
                 if tb_writer and getattr(opt, "pyramid_training", False):
                     tb_writer.add_scalar("training/pyramid_level", pyramid_level, iteration)
@@ -744,7 +791,7 @@ def run_training(
                     removed_them = True
                     new_round = False
 
-                if unbounded_online_train or iteration < opt.iterations:
+                if effective_final_iteration is None or iteration < effective_final_iteration:
                     triangles.optimizer.step()
                     triangles.optimizer.zero_grad(set_to_none=True)
     except KeyboardInterrupt:

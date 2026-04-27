@@ -78,7 +78,7 @@ python train.py -s <path_to_scenes> -m <output_model_path> --eval \
 
 `--pyramid_levels` counts the original image as level 0. The default three-level pyramid uses scales 1, 0.5, and 0.25. Training starts from the coarsest level, renders at that scale, and steps toward full-resolution supervision by `--pyramid_schedule_until_iter`. Leave the schedule at `0` to reach full resolution by `--densify_until_iter`.
 
-For primitive online replay with `train_online.py`, runs are unbounded by default when `--iterations` is not specified; stop them manually when done. Pass `--iterations <N>` for bounded smoke or benchmark runs. The default `--online_train_camera_growth_interval 0` auto-selects the reveal interval: in unbounded runs it reveals one new train camera per iteration until all cameras are visible, while bounded runs choose a cadence that reaches all train cameras by the final iteration when the budget allows it. Set a positive interval to force a fixed reveal cadence.
+For primitive online replay with `train_online.py`, runs do not need a user-specified total iteration count. When `--iterations` is omitted, the default `--online_train_camera_growth_interval 10` reveals one new train camera every ten optimization iterations, then stops after all train cameras have been revealed and optimized for one final reveal interval. Pass `--iterations <N>` for bounded smoke or benchmark runs, or set `--online_train_camera_growth_interval` to a positive value to force another fixed reveal cadence.
 
 ## SfM Initialization Ablation
 

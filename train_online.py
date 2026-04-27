@@ -55,6 +55,7 @@ if __name__ == "__main__":
     if args.online_train_unbounded or not iterations_explicit:
         args.online_train_unbounded = True
         args.iterations = 0
+        args.online_train_stop_when_frames_exhausted = True
     if args.iterations > 0:
         args.save_iterations.append(args.iterations)
 
@@ -88,6 +89,7 @@ if __name__ == "__main__":
             online_train_window_size=args.online_train_window_size,
             online_train_min_prune_cameras=args.online_train_min_prune_cameras,
             online_train_unbounded=args.online_train_unbounded,
+            online_train_stop_when_frames_exhausted=args.online_train_stop_when_frames_exhausted,
         ),
     )
 
