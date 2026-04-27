@@ -7,6 +7,7 @@ from random import randint
 import lpips
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from scene import Scene, TriangleModel
@@ -51,10 +52,139 @@ class TrainingRunConfig:
     rerun_app_id: str
     online_train: bool = False
     online_train_initial_cameras: int = 1
-    online_train_camera_growth_interval: int = 10
+    online_train_camera_growth_interval: int = 0
     online_train_camera_growth_count: int = 1
     online_train_window_size: int = 0
     online_train_min_prune_cameras: int = 250
+
+
+class _PyramidTrainingView:
+    def __init__(self, base_view, gt_image: torch.Tensor):
+        self.uid = getattr(base_view, "uid", None)
+        self.colmap_id = getattr(base_view, "colmap_id", None)
+        self.R = getattr(base_view, "R", None)
+        self.T = getattr(base_view, "T", None)
+        self.FoVx = base_view.FoVx
+        self.FoVy = base_view.FoVy
+        self.image_name = base_view.image_name
+        self.original_image = gt_image
+        self.image_width = gt_image.shape[2]
+        self.image_height = gt_image.shape[1]
+        self.zfar = base_view.zfar
+        self.znear = base_view.znear
+        self.trans = getattr(base_view, "trans", None)
+        self.scale = getattr(base_view, "scale", None)
+        self.world_view_transform = base_view.world_view_transform
+        self.projection_matrix = base_view.projection_matrix
+        self.full_proj_transform = base_view.full_proj_transform
+        self.camera_center = base_view.camera_center
+        self.gt_alpha_mask = None
+
+
+def _gaussian_downsample(image: torch.Tensor) -> torch.Tensor:
+    channels = image.shape[0]
+    kernel_1d = torch.tensor([1.0, 4.0, 6.0, 4.0, 1.0], dtype=image.dtype, device=image.device) / 16.0
+    kernel_2d = torch.outer(kernel_1d, kernel_1d).view(1, 1, 5, 5)
+    kernel = kernel_2d.expand(channels, 1, 5, 5)
+    image_batch = F.pad(image.unsqueeze(0), (2, 2, 2, 2), mode="replicate")
+    return F.conv2d(image_batch, kernel, stride=2, groups=channels).squeeze(0).clamp(0.0, 1.0)
+
+
+def _build_gaussian_pyramid(image: torch.Tensor, level_count: int) -> list[torch.Tensor]:
+    pyramid = [image]
+    for _ in range(1, max(1, level_count)):
+        previous = pyramid[-1]
+        if min(previous.shape[1], previous.shape[2]) <= 1:
+            break
+        pyramid.append(_gaussian_downsample(previous))
+    return pyramid
+
+
+def _get_gaussian_pyramid(view, level_count: int) -> list[torch.Tensor]:
+    requested_levels = max(1, int(level_count))
+    cached = getattr(view, "_training_gaussian_pyramid", None)
+    if cached is None or len(cached) < requested_levels:
+        with torch.no_grad():
+            cached = _build_gaussian_pyramid(view.original_image.cuda(), requested_levels)
+        setattr(view, "_training_gaussian_pyramid", cached)
+    return cached
+
+
+def _pyramid_schedule_until(opt) -> int:
+    configured_until = int(getattr(opt, "pyramid_schedule_until_iter", 0))
+    if configured_until > 0:
+        return configured_until
+    densify_until = int(getattr(opt, "densify_until_iter", 0))
+    if densify_until > 0:
+        return densify_until
+    return int(opt.iterations)
+
+
+def _pyramid_level_for_iteration(opt, iteration: int) -> int:
+    if not getattr(opt, "pyramid_training", False):
+        return 0
+
+    level_count = int(getattr(opt, "pyramid_levels", 1))
+    if level_count < 1:
+        raise ValueError(f"pyramid_levels must be >= 1, got {level_count}")
+    max_level = level_count - 1
+    if max_level == 0:
+        return 0
+
+    schedule_until = max(1, _pyramid_schedule_until(opt))
+    level = max_level - ((max(1, iteration) - 1) * level_count // schedule_until)
+    return max(0, min(max_level, level))
+
+
+def _training_view_for_iteration(view, opt, iteration: int):
+    pyramid_level = _pyramid_level_for_iteration(opt, iteration)
+    if pyramid_level == 0:
+        return view, view.original_image.cuda(), 0
+
+    pyramid = _get_gaussian_pyramid(view, int(getattr(opt, "pyramid_levels", 1)))
+    pyramid_level = min(pyramid_level, len(pyramid) - 1)
+    if pyramid_level == 0:
+        return view, view.original_image.cuda(), 0
+
+    gt_image = pyramid[pyramid_level]
+    return _PyramidTrainingView(view, gt_image), gt_image, pyramid_level
+
+
+def _ceil_div(numerator: int, denominator: int) -> int:
+    return (numerator + denominator - 1) // denominator
+
+
+def _resolve_online_growth_schedule(scene, run_config, opt):
+    requested_interval = int(run_config.online_train_camera_growth_interval)
+    growth_count = int(run_config.online_train_camera_growth_count)
+    if requested_interval < 0:
+        raise ValueError(f"online_train_camera_growth_interval must be >= 0, got {requested_interval}")
+    if growth_count <= 0:
+        raise ValueError(f"online_train_camera_growth_count must be > 0, got {growth_count}")
+
+    total_count = scene.getTotalTrainCameraCount()
+    requested_initial_count = int(run_config.online_train_initial_cameras)
+    if requested_initial_count <= 0:
+        raise ValueError(f"online_train_initial_cameras must be > 0, got {requested_initial_count}")
+
+    initial_count = min(requested_initial_count, total_count)
+    iterations = max(1, int(opt.iterations))
+
+    if requested_interval > 0:
+        steps = max(iterations - 1, 0) // requested_interval
+        expected_final_count = min(total_count, initial_count + steps * growth_count)
+        return requested_interval, expected_final_count, False
+
+    remaining_count = max(0, total_count - initial_count)
+    if remaining_count == 0:
+        return 1, total_count, True
+
+    updates_needed = _ceil_div(remaining_count, growth_count)
+    max_update_steps = max(1, iterations - 1)
+    growth_interval = max(1, max_update_steps // updates_needed)
+    steps = max(iterations - 1, 0) // growth_interval
+    expected_final_count = min(total_count, initial_count + steps * growth_count)
+    return growth_interval, expected_final_count, True
 
 
 def add_common_training_args(parser) -> None:
@@ -99,8 +229,11 @@ def add_online_training_args(parser) -> None:
     parser.add_argument(
         "--online_train_camera_growth_interval",
         type=int,
-        default=10,
-        help="Reveal more train cameras every N iterations during the primitive online replay.",
+        default=0,
+        help=(
+            "Reveal more train cameras every N iterations during the primitive online replay. "
+            "Use 0 to auto-select an interval that reaches all train cameras by the final iteration when possible."
+        ),
     )
     parser.add_argument(
         "--online_train_camera_growth_count",
@@ -228,12 +361,30 @@ def run_training(
             shuffle=not run_config.online_train,
         )
         if run_config.online_train:
+            online_growth_interval, expected_final_count, auto_growth_interval = _resolve_online_growth_schedule(
+                scene,
+                run_config,
+                opt,
+            )
             scene.enable_online_train_schedule(
                 initial_count=run_config.online_train_initial_cameras,
-                growth_interval=run_config.online_train_camera_growth_interval,
+                growth_interval=online_growth_interval,
                 growth_count=run_config.online_train_camera_growth_count,
                 window_size=run_config.online_train_window_size,
             )
+            if auto_growth_interval:
+                print(
+                    "Online train camera growth interval auto-selected: "
+                    f"every {online_growth_interval} iteration(s), expected to reveal "
+                    f"{expected_final_count}/{scene.getTotalTrainCameraCount()} train cameras by iteration "
+                    f"{int(opt.iterations)}."
+                )
+            elif expected_final_count < scene.getTotalTrainCameraCount():
+                print(
+                    "Warning: configured online train camera growth interval will reveal only "
+                    f"{expected_final_count}/{scene.getTotalTrainCameraCount()} train cameras by iteration "
+                    f"{int(opt.iterations)}. Use --online_train_camera_growth_interval 0 for automatic full-run coverage."
+                )
             print(
                 "Primitive online train replay enabled: "
                 "this mode only reveals frames incrementally and optionally restricts optimization "
@@ -270,6 +421,19 @@ def run_training(
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+        if getattr(opt, "pyramid_training", False):
+            if int(getattr(opt, "pyramid_levels", 1)) < 1:
+                raise ValueError(f"pyramid_levels must be >= 1, got {opt.pyramid_levels}")
+            if int(getattr(opt, "pyramid_schedule_until_iter", 0)) < 0:
+                raise ValueError(
+                    f"pyramid_schedule_until_iter must be >= 0, got {opt.pyramid_schedule_until_iter}"
+                )
+            schedule_until = _pyramid_schedule_until(opt)
+            print(
+                "Gaussian pyramid supervision enabled: "
+                f"{int(opt.pyramid_levels)} levels including the original image; "
+                f"scheduled to reach full resolution by iteration {schedule_until}."
+            )
 
         iter_start = torch.cuda.Event(enable_timing=True)
         iter_end = torch.cuda.Event(enable_timing=True)
@@ -336,7 +500,8 @@ def run_training(
 
             bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-            render_pkg = render(viewpoint_cam, triangles, pipe, bg)
+            training_view, gt_image, pyramid_level = _training_view_for_iteration(viewpoint_cam, opt, iteration)
+            render_pkg = render(training_view, triangles, pipe, bg)
             image = render_pkg["render"]
             triangle_area = render_pkg["density_factor"].detach()
             image_size = render_pkg["scaling"].detach()
@@ -351,7 +516,6 @@ def run_training(
             mask = importance_score > triangles.importance_score
             triangles.importance_score[mask] = importance_score[mask]
 
-            gt_image = viewpoint_cam.original_image.cuda()
             pixel_loss = loss_fn(image, gt_image)
             loss_image = (1.0 - opt.lambda_dssim) * pixel_loss + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
             loss_opacity = torch.abs(triangles.get_opacity).mean() * opt.lambda_opacity
@@ -385,7 +549,7 @@ def run_training(
                     rerun_logger.log_online_iteration(
                         iteration=iteration,
                         scene=scene,
-                        current_view=viewpoint_cam,
+                        current_view=training_view,
                         total_loss=loss.item(),
                         pixel_loss=pixel_loss.item(),
                         elapsed_ms=elapsed_ms,
@@ -413,10 +577,15 @@ def run_training(
 
                 ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
                 if iteration % 10 == 0:
-                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.5f}"})
+                    postfix = {"Loss": f"{ema_loss_for_log:.5f}"}
+                    if getattr(opt, "pyramid_training", False):
+                        postfix["Pyramid"] = pyramid_level
+                    progress_bar.set_postfix(postfix)
                     progress_bar.update(10)
                 if iteration == opt.iterations:
                     progress_bar.close()
+                if tb_writer and getattr(opt, "pyramid_training", False):
+                    tb_writer.add_scalar("training/pyramid_level", pyramid_level, iteration)
 
                 training_report(
                     tb_writer,

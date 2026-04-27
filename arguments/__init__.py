@@ -88,6 +88,9 @@ class OptimizationParams(ParamGroup):
         self.feature_lr = 0.0025
         self.opacity_lr = 0.014
         self.lambda_dssim = 0.2
+        self.pyramid_training = False
+        self.pyramid_levels = 3
+        self.pyramid_schedule_until_iter = 0
 
         self.densification_interval = 500
 

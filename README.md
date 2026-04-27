@@ -67,6 +67,19 @@ If you want to train the model on outdoor scenes, you should add the following c
 python train.py -s <path_to_scenes> -m <output_model_path> --outdoor --eval
 ```
 
+To train with coarse-to-fine Gaussian pyramid supervision, enable:
+
+```bash
+python train.py -s <path_to_scenes> -m <output_model_path> --eval \
+  --pyramid_training \
+  --pyramid_levels 3 \
+  --pyramid_schedule_until_iter 25000
+```
+
+`--pyramid_levels` counts the original image as level 0. The default three-level pyramid uses scales 1, 0.5, and 0.25. Training starts from the coarsest level, renders at that scale, and steps toward full-resolution supervision by `--pyramid_schedule_until_iter`. Leave the schedule at `0` to reach full resolution by `--densify_until_iter`.
+
+For primitive online replay with `train_online.py`, the default `--online_train_camera_growth_interval 0` auto-selects the reveal interval so a full run reaches all train cameras by the final iteration when the iteration budget allows it. Set a positive interval to force a fixed reveal cadence.
+
 ## SfM Initialization Ablation
 
 The Kimera/COLMAP SfM ablation uses raw Kimera images and Kimera camera poses to seed COLMAP, triangulates a sparse point cloud, undistorts the reconstruction into the standard COLMAP dataset layout, and trains triangle splatting from the existing point-cloud initializer.
