@@ -1,4 +1,5 @@
 import os
+import time
 import uuid
 from argparse import Namespace
 from dataclasses import dataclass
@@ -627,6 +628,7 @@ def run_training(
                 elapsed_ms = iter_start.elapsed_time(iter_end)
 
                 if run_config.online_train:
+                    visualization_start = time.perf_counter()
                     online_live_view = training_view
                     online_live_image = image
                     online_live_gt_image = gt_image
@@ -656,7 +658,11 @@ def run_training(
                         gt_image=online_live_gt_image,
                         schedule_changed=online_schedule_changed,
                     )
+                    if rerun_logger.enabled:
+                        visualization_ms = (time.perf_counter() - visualization_start) * 1000.0
+                        rerun_logger.log_scalar("online/visualization_ms", "iteration", iteration, visualization_ms)
                 else:
+                    visualization_start = time.perf_counter()
                     rerun_logger.log_training_iteration(
                         iteration=iteration,
                         total_loss=loss.item(),
@@ -669,6 +675,9 @@ def run_training(
                         render_image=image,
                         gt_image=gt_image,
                     )
+                    if rerun_logger.enabled:
+                        visualization_ms = (time.perf_counter() - visualization_start) * 1000.0
+                        rerun_logger.log_scalar("training/visualization_ms", "iteration", iteration, visualization_ms)
 
                 ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
                 if iteration % 10 == 0:

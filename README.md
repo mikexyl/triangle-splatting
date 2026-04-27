@@ -209,6 +209,8 @@ Useful options:
 - `--rerun_mesh_every <N>` controls how often the live triangle mesh is refreshed.
 - `--rerun_max_triangles <N>` limits mesh logging to a sampled subset for responsiveness. Use `0` to log all triangles.
 
+Rerun records `runtime_ms` as the core CUDA forward/backward training time and `visualization_ms` as the separate wall-clock overhead from visualization-only renders and Rerun logging.
+
 ## Evaluation
 To evaluate the model, you can use the following command:
 ```bash

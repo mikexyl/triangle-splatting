@@ -149,6 +149,7 @@ class RerunLogger:
                             origin="/training",
                             contents=[
                                 "/training/runtime_ms",
+                                "/training/visualization_ms",
                                 "/training/state/triangle_count",
                             ],
                         ),
@@ -222,6 +223,7 @@ class RerunLogger:
                             origin="/online/state",
                             contents=[
                                 "/online/runtime_ms",
+                                "/online/visualization_ms",
                                 "/online/state/triangle_count",
                                 "/online/state/revealed_count",
                                 "/online/state/window_count",
