@@ -49,8 +49,14 @@ if __name__ == "__main__":
     add_rerun_args(parser)
     add_online_training_args(parser)
 
-    args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
+    raw_args = sys.argv[1:]
+    iterations_explicit = any(arg == "--iterations" or arg.startswith("--iterations=") for arg in raw_args)
+    args = parser.parse_args(raw_args)
+    if args.online_train_unbounded or not iterations_explicit:
+        args.online_train_unbounded = True
+        args.iterations = 0
+    if args.iterations > 0:
+        args.save_iterations.append(args.iterations)
 
     print("Optimizing " + args.model_path)
 
@@ -81,6 +87,7 @@ if __name__ == "__main__":
             online_train_camera_growth_count=args.online_train_camera_growth_count,
             online_train_window_size=args.online_train_window_size,
             online_train_min_prune_cameras=args.online_train_min_prune_cameras,
+            online_train_unbounded=args.online_train_unbounded,
         ),
     )
 

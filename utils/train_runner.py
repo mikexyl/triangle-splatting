@@ -2,6 +2,7 @@ import os
 import uuid
 from argparse import Namespace
 from dataclasses import dataclass
+from itertools import count
 from random import randint
 
 import lpips
@@ -40,6 +41,7 @@ ONLINE_TRAIN_ARG_NAMES = (
     "online_train_camera_growth_count",
     "online_train_window_size",
     "online_train_min_prune_cameras",
+    "online_train_unbounded",
 )
 
 SEED_INIT_ARG_NAMES = (
@@ -56,6 +58,7 @@ class TrainingRunConfig:
     online_train_camera_growth_count: int = 1
     online_train_window_size: int = 0
     online_train_min_prune_cameras: int = 250
+    online_train_unbounded: bool = False
 
 
 class _PyramidTrainingView:
@@ -168,15 +171,20 @@ def _resolve_online_growth_schedule(scene, run_config, opt):
         raise ValueError(f"online_train_initial_cameras must be > 0, got {requested_initial_count}")
 
     initial_count = min(requested_initial_count, total_count)
-    iterations = max(1, int(opt.iterations))
+    iterations = int(opt.iterations)
+    unbounded_online_train = bool(getattr(run_config, "online_train_unbounded", False)) or iterations <= 0
 
     if requested_interval > 0:
+        if unbounded_online_train:
+            return requested_interval, None, False
         steps = max(iterations - 1, 0) // requested_interval
         expected_final_count = min(total_count, initial_count + steps * growth_count)
         return requested_interval, expected_final_count, False
 
     remaining_count = max(0, total_count - initial_count)
     if remaining_count == 0:
+        return 1, total_count, True
+    if unbounded_online_train:
         return 1, total_count, True
 
     updates_needed = _ceil_div(remaining_count, growth_count)
@@ -232,7 +240,8 @@ def add_online_training_args(parser) -> None:
         default=0,
         help=(
             "Reveal more train cameras every N iterations during the primitive online replay. "
-            "Use 0 to auto-select an interval that reaches all train cameras by the final iteration when possible."
+            "Use 0 to reveal one new train camera per iteration in unbounded replay, or to auto-select "
+            "an interval that reaches all train cameras by the final iteration in bounded replay when possible."
         ),
     )
     parser.add_argument(
@@ -252,6 +261,11 @@ def add_online_training_args(parser) -> None:
         type=int,
         default=250,
         help="Minimum number of revealed train cameras before densification/pruning is allowed.",
+    )
+    parser.add_argument(
+        "--online_train_unbounded",
+        action="store_true",
+        help="Run primitive online replay without a final iteration cap; stop it manually when done.",
     )
 
 
@@ -341,10 +355,17 @@ def run_training(
     lpips_fn = lpips.LPIPS(net="vgg").to(device="cuda")
 
     first_iter = 0
+    last_iteration = 0
     tb_writer = prepare_output_and_logger(dataset)
     rerun_logger = RerunLogger(run_config.rerun_app_id, create_rerun_config(dataset))
 
     try:
+        unbounded_online_train = run_config.online_train and (
+            bool(getattr(run_config, "online_train_unbounded", False)) or int(opt.iterations) <= 0
+        )
+        if not unbounded_online_train and int(opt.iterations) <= 0:
+            raise ValueError("--iterations must be > 0 unless primitive online replay is unbounded")
+
         seed_init_mode = getattr(dataset, "seed_init_mode", "point")
         if seed_init_mode == "mesh_triangle" and opt.nb_points != 3:
             raise ValueError("seed_init_mode=mesh_triangle requires --nb_points 3")
@@ -373,13 +394,20 @@ def run_training(
                 window_size=run_config.online_train_window_size,
             )
             if auto_growth_interval:
-                print(
-                    "Online train camera growth interval auto-selected: "
-                    f"every {online_growth_interval} iteration(s), expected to reveal "
-                    f"{expected_final_count}/{scene.getTotalTrainCameraCount()} train cameras by iteration "
-                    f"{int(opt.iterations)}."
-                )
-            elif expected_final_count < scene.getTotalTrainCameraCount():
+                if unbounded_online_train:
+                    print(
+                        "Online train camera growth interval auto-selected: "
+                        f"every {online_growth_interval} iteration(s). No final iteration cap is set; "
+                        f"the replay will reveal up to {scene.getTotalTrainCameraCount()} train cameras as it runs."
+                    )
+                else:
+                    print(
+                        "Online train camera growth interval auto-selected: "
+                        f"every {online_growth_interval} iteration(s), expected to reveal "
+                        f"{expected_final_count}/{scene.getTotalTrainCameraCount()} train cameras by iteration "
+                        f"{int(opt.iterations)}."
+                    )
+            elif expected_final_count is not None and expected_final_count < scene.getTotalTrainCameraCount():
                 print(
                     "Warning: configured online train camera growth interval will reveal only "
                     f"{expected_final_count}/{scene.getTotalTrainCameraCount()} train cameras by iteration "
@@ -444,8 +472,13 @@ def run_training(
             raise RuntimeError("Training requires at least one active train camera.")
 
         ema_loss_for_log = 0.0
-        progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
-        first_iter += 1
+        progress_bar = (
+            tqdm(total=None, initial=first_iter, desc="Training progress")
+            if unbounded_online_train
+            else tqdm(range(first_iter, opt.iterations), desc="Training progress")
+        )
+        start_iteration = first_iter + 1
+        iteration_range = count(start_iteration) if unbounded_online_train else range(start_iteration, opt.iterations + 1)
 
         total_dead = 0
         opacity_now = True
@@ -455,7 +488,8 @@ def run_training(
         large_scene = triangles.large
         loss_fn = l2_loss if large_scene and outdoor else l1_loss
 
-        for iteration in range(first_iter, opt.iterations + 1):
+        for iteration in iteration_range:
+            last_iteration = iteration
             iter_start.record()
             triangles.update_learning_rate(iteration)
 
@@ -596,7 +630,7 @@ def run_training(
                         postfix["Pyramid"] = pyramid_level
                     progress_bar.set_postfix(postfix)
                     progress_bar.update(10)
-                if iteration == opt.iterations:
+                if not unbounded_online_train and iteration == opt.iterations:
                     progress_bar.close()
                 if tb_writer and getattr(opt, "pyramid_training", False):
                     tb_writer.add_scalar("training/pyramid_level", pyramid_level, iteration)
@@ -710,10 +744,19 @@ def run_training(
                     removed_them = True
                     new_round = False
 
-                if iteration < opt.iterations:
+                if unbounded_online_train or iteration < opt.iterations:
                     triangles.optimizer.step()
                     triangles.optimizer.zero_grad(set_to_none=True)
+    except KeyboardInterrupt:
+        if not run_config.online_train:
+            raise
+        print("\nOnline training interrupted by user.")
+        if run_config.online_train and last_iteration > 0:
+            print(f"[ITER {last_iteration}] Saving Triangles before exit")
+            scene.save(last_iteration)
     finally:
+        if "progress_bar" in locals():
+            progress_bar.close()
         rerun_logger.close()
 
     print("Training is done")
