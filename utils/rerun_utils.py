@@ -532,6 +532,11 @@ class RerunLogger:
             self._log_camera_points("online/scene/test_points", test_views, [140, 140, 140], static=True)
             self._log_camera_path("online/scene/test_path", test_views, [140, 140, 140], static=True)
 
+    def should_log_online_live(self, iteration: int, schedule_changed: bool = False) -> bool:
+        if not self.enabled:
+            return False
+        return iteration == 1 or schedule_changed or iteration % self.config.image_every == 0
+
     def log_online_iteration(
         self,
         iteration: int,
@@ -593,7 +598,7 @@ class RerunLogger:
                 radius=0.015,
             )
 
-        if iteration == 1 or schedule_changed or iteration % self.config.image_every == 0:
+        if self.should_log_online_live(iteration, schedule_changed):
             self.log_image("online/live/render", "iteration", iteration, render_image)
             self.log_image("online/live/ground_truth", "iteration", iteration, gt_image)
             self._log_pinhole_camera(

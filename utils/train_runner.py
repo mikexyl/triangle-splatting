@@ -546,10 +546,24 @@ def run_training(
                 elapsed_ms = iter_start.elapsed_time(iter_end)
 
                 if run_config.online_train:
+                    online_live_view = training_view
+                    online_live_image = image
+                    online_live_gt_image = gt_image
+                    if rerun_logger.should_log_online_live(iteration, online_schedule_changed):
+                        active_window = scene.getActiveTrainWindow()
+                        latest_active_view = active_window[-1] if active_window else viewpoint_cam
+                        if latest_active_view is not viewpoint_cam:
+                            online_live_view, online_live_gt_image, _ = _training_view_for_iteration(
+                                latest_active_view,
+                                opt,
+                                iteration,
+                            )
+                            online_live_image = render(online_live_view, triangles, pipe, bg)["render"]
+
                     rerun_logger.log_online_iteration(
                         iteration=iteration,
                         scene=scene,
-                        current_view=training_view,
+                        current_view=online_live_view,
                         total_loss=loss.item(),
                         pixel_loss=pixel_loss.item(),
                         elapsed_ms=elapsed_ms,
@@ -557,8 +571,8 @@ def run_training(
                         triangles_points=scene.triangles.get_triangles_points,
                         features_dc=scene.triangles._features_dc,
                         opacity=scene.triangles.get_opacity,
-                        render_image=image,
-                        gt_image=gt_image,
+                        render_image=online_live_image,
+                        gt_image=online_live_gt_image,
                         schedule_changed=online_schedule_changed,
                     )
                 else:
