@@ -554,6 +554,8 @@ class RerunLogger:
         render_image: torch.Tensor,
         gt_image: torch.Tensor,
         schedule_changed: bool = False,
+        force_live: bool = False,
+        force_state: bool = False,
     ) -> None:
         if not self.enabled:
             return
@@ -566,7 +568,7 @@ class RerunLogger:
         self.log_scalar("online/state/window_count", "iteration", iteration, float(scene.getActiveTrainWindowCount()))
         self.log_scalar("online/state/window_start", "iteration", iteration, float(scene.getActiveTrainWindowStart()))
 
-        if iteration == 1 or schedule_changed:
+        if iteration == 1 or schedule_changed or force_state:
             revealed_views = scene.getRevealedTrainCameras()
             active_window_views = scene.getActiveTrainWindow()
             self._log_camera_points(
@@ -600,7 +602,7 @@ class RerunLogger:
                 radius=0.015,
             )
 
-        if self.should_log_online_live(iteration, schedule_changed):
+        if force_live or self.should_log_online_live(iteration, schedule_changed):
             self.log_image("online/live/render", "iteration", iteration, render_image)
             self.log_image("online/live/ground_truth", "iteration", iteration, gt_image)
             self._log_pinhole_camera(

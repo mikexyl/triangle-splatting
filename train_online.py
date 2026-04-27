@@ -51,7 +51,13 @@ if __name__ == "__main__":
 
     raw_args = sys.argv[1:]
     iterations_explicit = any(arg == "--iterations" or arg.startswith("--iterations=") for arg in raw_args)
+    growth_interval_explicit = any(
+        arg == "--online_train_camera_growth_interval" or arg.startswith("--online_train_camera_growth_interval=")
+        for arg in raw_args
+    )
     args = parser.parse_args(raw_args)
+    if args.pyramid_training and not growth_interval_explicit:
+        args.online_train_camera_growth_interval = args.pyramid_levels * args.online_train_pyramid_level_iterations
     if args.online_train_unbounded or not iterations_explicit:
         args.online_train_unbounded = True
         args.iterations = 0
@@ -86,6 +92,7 @@ if __name__ == "__main__":
             online_train_initial_cameras=args.online_train_initial_cameras,
             online_train_camera_growth_interval=args.online_train_camera_growth_interval,
             online_train_camera_growth_count=args.online_train_camera_growth_count,
+            online_train_pyramid_level_iterations=args.online_train_pyramid_level_iterations,
             online_train_window_size=args.online_train_window_size,
             online_train_min_prune_cameras=args.online_train_min_prune_cameras,
             online_train_unbounded=args.online_train_unbounded,

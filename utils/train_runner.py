@@ -40,6 +40,7 @@ ONLINE_TRAIN_ARG_NAMES = (
     "online_train_initial_cameras",
     "online_train_camera_growth_interval",
     "online_train_camera_growth_count",
+    "online_train_pyramid_level_iterations",
     "online_train_window_size",
     "online_train_min_prune_cameras",
     "online_train_unbounded",
@@ -58,6 +59,7 @@ class TrainingRunConfig:
     online_train_initial_cameras: int = 1
     online_train_camera_growth_interval: int = 0
     online_train_camera_growth_count: int = 1
+    online_train_pyramid_level_iterations: int = 8
     online_train_window_size: int = 10
     online_train_min_prune_cameras: int = 250
     online_train_unbounded: bool = False
@@ -142,8 +144,73 @@ def _pyramid_level_for_iteration(opt, iteration: int) -> int:
     return max(0, min(max_level, level))
 
 
-def _training_view_for_iteration(view, opt, iteration: int):
-    pyramid_level = _pyramid_level_for_iteration(opt, iteration)
+def _online_staged_pyramid_enabled(run_config, opt) -> bool:
+    return bool(getattr(run_config, "online_train", False)) and bool(getattr(opt, "pyramid_training", False))
+
+
+def _online_staged_pyramid_interval(run_config, opt) -> int | None:
+    if not _online_staged_pyramid_enabled(run_config, opt):
+        return None
+
+    level_count = int(getattr(opt, "pyramid_levels", 1))
+    if level_count < 1:
+        raise ValueError(f"pyramid_levels must be >= 1, got {level_count}")
+
+    per_level_iterations = int(getattr(run_config, "online_train_pyramid_level_iterations", 8))
+    if per_level_iterations <= 0:
+        raise ValueError(
+            "online_train_pyramid_level_iterations must be > 0 when online pyramid training is enabled, "
+            f"got {per_level_iterations}"
+        )
+
+    growth_count = int(getattr(run_config, "online_train_camera_growth_count", 1))
+    if growth_count != 1:
+        raise ValueError(
+            "online per-frame pyramid training requires online_train_camera_growth_count=1 so every frame "
+            f"receives its own staged schedule, got {growth_count}"
+        )
+
+    return level_count * per_level_iterations
+
+
+def _online_pyramid_level_for_iteration(run_config, opt, iteration: int) -> int:
+    level_count = int(getattr(opt, "pyramid_levels", 1))
+    if level_count < 1:
+        raise ValueError(f"pyramid_levels must be >= 1, got {level_count}")
+
+    max_level = level_count - 1
+    if max_level == 0:
+        return 0
+
+    per_level_iterations = int(getattr(run_config, "online_train_pyramid_level_iterations", 8))
+    if per_level_iterations <= 0:
+        raise ValueError(
+            "online_train_pyramid_level_iterations must be > 0 when online pyramid training is enabled, "
+            f"got {per_level_iterations}"
+        )
+
+    local_iteration = max(0, (max(1, iteration) - 1) % (level_count * per_level_iterations))
+    level_stage = min(level_count - 1, local_iteration // per_level_iterations)
+    return max_level - level_stage
+
+
+def _online_pyramid_frame_end_iteration(run_config, opt, iteration: int) -> bool:
+    if not _online_staged_pyramid_enabled(run_config, opt):
+        return False
+
+    frame_iterations = _online_staged_pyramid_interval(run_config, opt)
+    return max(1, iteration) % frame_iterations == 0
+
+
+def _training_view_for_pyramid_level(view, opt, pyramid_level: int):
+    if not getattr(opt, "pyramid_training", False):
+        pyramid_level = 0
+
+    level_count = int(getattr(opt, "pyramid_levels", 1))
+    if level_count < 1:
+        raise ValueError(f"pyramid_levels must be >= 1, got {level_count}")
+
+    pyramid_level = max(0, min(level_count - 1, int(pyramid_level)))
     if pyramid_level == 0:
         return view, view.original_image.cuda(), 0
 
@@ -154,6 +221,10 @@ def _training_view_for_iteration(view, opt, iteration: int):
 
     gt_image = pyramid[pyramid_level]
     return _PyramidTrainingView(view, gt_image), gt_image, pyramid_level
+
+
+def _training_view_for_iteration(view, opt, iteration: int):
+    return _training_view_for_pyramid_level(view, opt, _pyramid_level_for_iteration(opt, iteration))
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
@@ -186,6 +257,15 @@ def _resolve_online_growth_schedule(scene, run_config, opt):
     initial_count = min(requested_initial_count, total_count)
     iterations = int(opt.iterations)
     unbounded_online_train = bool(getattr(run_config, "online_train_unbounded", False)) or iterations <= 0
+    staged_pyramid_interval = _online_staged_pyramid_interval(run_config, opt)
+    if staged_pyramid_interval is not None:
+        if requested_interval not in (0, staged_pyramid_interval):
+            raise ValueError(
+                "online_train_camera_growth_interval must match the per-frame pyramid schedule "
+                f"({staged_pyramid_interval}) when online pyramid training is enabled, got {requested_interval}. "
+                "Use 0 to let the staged pyramid schedule choose the cadence."
+            )
+        requested_interval = staged_pyramid_interval
 
     if requested_interval > 0:
         if unbounded_online_train:
@@ -253,8 +333,10 @@ def add_online_training_args(parser) -> None:
         default=10,
         help=(
             "Reveal more train cameras every N iterations during the primitive online replay. "
-            "The default 10 gives 10 optimization iterations per newly revealed frame. Use 0 to auto-select "
-            "a cadence from the bounded run length, or one new frame per iteration in open-ended replay."
+            "The default 10 gives 10 optimization iterations per newly revealed frame. Online pyramid "
+            "training derives this from --pyramid_levels and --online_train_pyramid_level_iterations unless "
+            "an explicit matching value is passed. Use 0 to auto-select a cadence from the bounded run "
+            "length, or to use the staged pyramid cadence when online pyramid training is enabled."
         ),
     )
     parser.add_argument(
@@ -262,6 +344,15 @@ def add_online_training_args(parser) -> None:
         type=int,
         default=1,
         help="Number of additional train cameras to reveal at each replay step.",
+    )
+    parser.add_argument(
+        "--online_train_pyramid_level_iterations",
+        type=int,
+        default=8,
+        help=(
+            "Optimization iterations per Gaussian pyramid level for primitive online replay. With the "
+            "default 3 pyramid levels this trains 24 iterations per revealed image, from coarse to fine."
+        ),
     )
     parser.add_argument(
         "--online_train_window_size",
@@ -485,6 +576,8 @@ def run_training(
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+        online_staged_pyramid = _online_staged_pyramid_enabled(run_config, opt)
+        online_staged_pyramid_interval = _online_staged_pyramid_interval(run_config, opt)
         if getattr(opt, "pyramid_training", False):
             if int(getattr(opt, "pyramid_levels", 1)) < 1:
                 raise ValueError(f"pyramid_levels must be >= 1, got {opt.pyramid_levels}")
@@ -492,12 +585,26 @@ def run_training(
                 raise ValueError(
                     f"pyramid_schedule_until_iter must be >= 0, got {opt.pyramid_schedule_until_iter}"
                 )
-            schedule_until = _pyramid_schedule_until(opt)
-            print(
-                "Gaussian pyramid supervision enabled: "
-                f"{int(opt.pyramid_levels)} levels including the original image; "
-                f"scheduled to reach full resolution by iteration {schedule_until}."
-            )
+            if online_staged_pyramid:
+                print(
+                    "Gaussian pyramid supervision enabled for online replay: "
+                    f"{int(opt.pyramid_levels)} levels including the original image; "
+                    f"{int(run_config.online_train_pyramid_level_iterations)} iteration(s) per level; "
+                    f"{online_staged_pyramid_interval} iteration(s) per revealed frame from coarse to fine. "
+                    "--pyramid_schedule_until_iter is ignored in this mode."
+                )
+                print(
+                    "Online Rerun visualization for staged pyramid training will be logged once per revealed "
+                    f"frame, at the final iteration of each {online_staged_pyramid_interval}-iteration "
+                    "coarse-to-fine frame block."
+                )
+            else:
+                schedule_until = _pyramid_schedule_until(opt)
+                print(
+                    "Gaussian pyramid supervision enabled: "
+                    f"{int(opt.pyramid_levels)} levels including the original image; "
+                    f"scheduled to reach full resolution by iteration {schedule_until}."
+                )
 
         iter_start = torch.cuda.Event(enable_timing=True)
         iter_end = torch.cuda.Event(enable_timing=True)
@@ -566,23 +673,38 @@ def run_training(
             if iteration % 1000 == 0:
                 triangles.oneupSHdegree()
 
-            if not viewpoint_stack:
-                viewpoint_stack = scene.getTrainCameras().copy()
-                if not new_round and removed_them:
-                    new_round = True
-                    removed_them = False
-                else:
-                    new_round = False
+            if online_staged_pyramid:
+                revealed_train_views = scene.getRevealedTrainCameras()
+                if not revealed_train_views:
+                    raise RuntimeError("Online pyramid training requires at least one revealed train camera.")
+                viewpoint_cam = revealed_train_views[-1]
+                new_round = False
+            else:
+                if not viewpoint_stack:
+                    viewpoint_stack = scene.getTrainCameras().copy()
+                    if not new_round and removed_them:
+                        new_round = True
+                        removed_them = False
+                    else:
+                        new_round = False
+                viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
             number_of_views = len(scene.getTrainCameras())
-            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
             if (iteration - 1) == debug_from:
                 pipe.debug = True
 
             bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-            training_view, gt_image, pyramid_level = _training_view_for_iteration(viewpoint_cam, opt, iteration)
+            if online_staged_pyramid:
+                pyramid_level = _online_pyramid_level_for_iteration(run_config, opt, iteration)
+                training_view, gt_image, pyramid_level = _training_view_for_pyramid_level(
+                    viewpoint_cam,
+                    opt,
+                    pyramid_level,
+                )
+            else:
+                training_view, gt_image, pyramid_level = _training_view_for_iteration(viewpoint_cam, opt, iteration)
             render_pkg = render(training_view, triangles, pipe, bg)
             image = render_pkg["render"]
             triangle_area = render_pkg["density_factor"].detach()
@@ -628,39 +750,48 @@ def run_training(
                 elapsed_ms = iter_start.elapsed_time(iter_end)
 
                 if run_config.online_train:
-                    visualization_start = time.perf_counter()
-                    online_live_view = training_view
-                    online_live_image = image
-                    online_live_gt_image = gt_image
-                    if rerun_logger.should_log_online_live(iteration, online_schedule_changed):
-                        active_window = scene.getActiveTrainWindow()
-                        latest_active_view = active_window[-1] if active_window else viewpoint_cam
-                        if latest_active_view is not viewpoint_cam:
-                            online_live_view, online_live_gt_image, _ = _training_view_for_iteration(
-                                latest_active_view,
-                                opt,
-                                iteration,
-                            )
-                            online_live_image = render(online_live_view, triangles, pipe, bg)["render"]
-
-                    rerun_logger.log_online_iteration(
-                        iteration=iteration,
-                        scene=scene,
-                        current_view=online_live_view,
-                        total_loss=loss.item(),
-                        pixel_loss=pixel_loss.item(),
-                        elapsed_ms=elapsed_ms,
-                        total_triangles=scene.triangles.get_triangles_points.shape[0],
-                        triangles_points=scene.triangles.get_triangles_points,
-                        features_dc=scene.triangles._features_dc,
-                        opacity=scene.triangles.get_opacity,
-                        render_image=online_live_image,
-                        gt_image=online_live_gt_image,
-                        schedule_changed=online_schedule_changed,
+                    online_visualization_due = (
+                        (not online_staged_pyramid)
+                        or _online_pyramid_frame_end_iteration(run_config, opt, iteration)
                     )
-                    if rerun_logger.enabled:
-                        visualization_ms = (time.perf_counter() - visualization_start) * 1000.0
-                        rerun_logger.log_scalar("online/visualization_ms", "iteration", iteration, visualization_ms)
+                    if online_visualization_due:
+                        visualization_start = time.perf_counter()
+                        online_live_view = training_view
+                        online_live_image = image
+                        online_live_gt_image = gt_image
+                        force_live = online_staged_pyramid
+                        force_state = online_staged_pyramid
+                        if (not force_live) and rerun_logger.should_log_online_live(iteration, online_schedule_changed):
+                            active_window = scene.getActiveTrainWindow()
+                            latest_active_view = active_window[-1] if active_window else viewpoint_cam
+                            if latest_active_view is not viewpoint_cam:
+                                online_live_view, online_live_gt_image, _ = _training_view_for_iteration(
+                                    latest_active_view,
+                                    opt,
+                                    iteration,
+                                )
+                                online_live_image = render(online_live_view, triangles, pipe, bg)["render"]
+
+                        rerun_logger.log_online_iteration(
+                            iteration=iteration,
+                            scene=scene,
+                            current_view=online_live_view,
+                            total_loss=loss.item(),
+                            pixel_loss=pixel_loss.item(),
+                            elapsed_ms=elapsed_ms,
+                            total_triangles=scene.triangles.get_triangles_points.shape[0],
+                            triangles_points=scene.triangles.get_triangles_points,
+                            features_dc=scene.triangles._features_dc,
+                            opacity=scene.triangles.get_opacity,
+                            render_image=online_live_image,
+                            gt_image=online_live_gt_image,
+                            schedule_changed=online_schedule_changed,
+                            force_live=force_live,
+                            force_state=force_state,
+                        )
+                        if rerun_logger.enabled:
+                            visualization_ms = (time.perf_counter() - visualization_start) * 1000.0
+                            rerun_logger.log_scalar("online/visualization_ms", "iteration", iteration, visualization_ms)
                 else:
                     visualization_start = time.perf_counter()
                     rerun_logger.log_training_iteration(
