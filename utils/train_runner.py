@@ -57,7 +57,7 @@ class TrainingRunConfig:
     online_train_initial_cameras: int = 1
     online_train_camera_growth_interval: int = 0
     online_train_camera_growth_count: int = 1
-    online_train_window_size: int = 0
+    online_train_window_size: int = 10
     online_train_min_prune_cameras: int = 250
     online_train_unbounded: bool = False
     online_train_stop_when_frames_exhausted: bool = False
@@ -265,7 +265,7 @@ def add_online_training_args(parser) -> None:
     parser.add_argument(
         "--online_train_window_size",
         type=int,
-        default=0,
+        default=10,
         help="Sliding local optimization window over the revealed train cameras; 0 uses the full revealed prefix.",
     )
     parser.add_argument(

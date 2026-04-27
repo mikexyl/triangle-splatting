@@ -78,7 +78,7 @@ python train.py -s <path_to_scenes> -m <output_model_path> --eval \
 
 `--pyramid_levels` counts the original image as level 0. The default three-level pyramid uses scales 1, 0.5, and 0.25. Training starts from the coarsest level, renders at that scale, and steps toward full-resolution supervision by `--pyramid_schedule_until_iter`. Leave the schedule at `0` to reach full resolution by `--densify_until_iter`.
 
-For primitive online replay with `train_online.py`, runs do not need a user-specified total iteration count. When `--iterations` is omitted, the default `--online_train_camera_growth_interval 10` reveals one new train camera every ten optimization iterations, then stops after all train cameras have been revealed and optimized for one final reveal interval. Pass `--iterations <N>` for bounded smoke or benchmark runs, or set `--online_train_camera_growth_interval` to a positive value to force another fixed reveal cadence.
+For primitive online replay with `train_online.py`, runs do not need a user-specified total iteration count. When `--iterations` is omitted, the default `--online_train_camera_growth_interval 10` reveals one new train camera every ten optimization iterations, optimizes over a sliding `--online_train_window_size 10` local frame window, then stops after all train cameras have been revealed and optimized for one final reveal interval. Pass `--iterations <N>` for bounded smoke or benchmark runs, set `--online_train_camera_growth_interval` to a positive value to force another fixed reveal cadence, or set `--online_train_window_size 0` to restore full-prefix optimization.
 
 ## SfM Initialization Ablation
 
@@ -131,13 +131,14 @@ python scripts/prepare_kimera_capture_dataset.py \
   --mesh-voxel-size 0.05 \
   --mesh-sample-spacing 0.05 \
   --mesh-triangle-max-edge 0.25 \
+  --mesh-triangle-scale 5.0 \
   --mesh-triangle-max-count 50000 \
   --mesh-triangle-color-source texture \
   --mesh-triangle-merge-mode voxel \
   --mesh-triangle-merge-voxel-size 0.05
 ```
 
-Use `--mesh-triangle-merge-mode concat` to preserve the previous unreduced behavior. The vicon-room reduced mesh workflow is also available through Pixi:
+`--mesh-triangle-scale` expands each saved mesh seed triangle around its own centroid. The Vicon room recipe uses `5.0` so the initial triangle-splat render has fuller coverage than the raw Kimera mesh faces. Use `--mesh-triangle-merge-mode concat` to preserve the previous unreduced behavior. The vicon-room reduced mesh workflow is also available through Pixi:
 
 ```bash
 pixi run prepare-kimera-mesh-vicon-room-1-reduced

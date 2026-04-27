@@ -408,6 +408,14 @@ def _triangle_max_edges(triangles: np.ndarray) -> np.ndarray:
     return np.maximum(np.maximum(edge_ab, edge_bc), edge_ca)
 
 
+def _scale_triangles_about_centroids(triangles: np.ndarray, scale: float) -> np.ndarray:
+    triangles = np.asarray(triangles, dtype=np.float32)
+    if len(triangles) == 0 or scale == 1.0:
+        return triangles.astype(np.float32, copy=False)
+    centroids = triangles.mean(axis=1, keepdims=True)
+    return (centroids + float(scale) * (triangles - centroids)).astype(np.float32, copy=False)
+
+
 def _subdivide_triangles_by_max_edge(
     triangles: np.ndarray,
     max_edge: float,
@@ -1781,6 +1789,7 @@ def _build_mesh_seed_entries(
     triangle_merge_mode: str,
     triangle_merge_voxel_size: float,
     triangle_merge_normal_bins: int,
+    triangle_scale: float,
     triangle_sizing_mode: str,
     adaptive_min_edge: float,
     adaptive_max_edge: float,
@@ -1815,6 +1824,7 @@ def _build_mesh_seed_entries(
             "texture_seed_file_count": 0,
             "color_source": triangle_color_source,
             "sizing_mode": triangle_sizing_mode,
+            "scale": float(triangle_scale),
             "reduction": empty_reduction,
         }, np.empty((0, 3), dtype=np.float32), np.empty((0, 3, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32)
 
@@ -1919,6 +1929,7 @@ def _build_mesh_seed_entries(
                             **(adaptive_stats or {}),
                         }
                     )
+                mesh_triangles = _scale_triangles_about_centroids(mesh_triangles, triangle_scale)
                 textured_triangle_count = int(triangle_texture_mask.sum())
                 triangle_seed_file_count += 1
                 if textured_triangle_count > 0:
@@ -1991,6 +2002,7 @@ def _build_mesh_seed_entries(
             "texture_seed_file_count": texture_seed_file_count,
             "color_source": triangle_color_source,
             "sizing_mode": triangle_sizing_mode,
+            "scale": float(triangle_scale),
             "reduction": empty_reduction,
         }, np.empty((0, 3), dtype=np.float32), np.empty((0, 3, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32)
 
@@ -2064,6 +2076,7 @@ def _build_mesh_seed_entries(
         "texture_seed_file_count": int(texture_seed_file_count),
         "color_source": triangle_color_source,
         "sizing_mode": triangle_sizing_mode,
+        "scale": float(triangle_scale),
         "adaptive": adaptive_summary,
         "area": _percentiles(_triangle_areas(triangles)),
         "max_edge_distribution": _percentiles(_triangle_max_edges(triangles)) if len(triangles) else {},
@@ -2161,6 +2174,12 @@ def main() -> None:
         type=int,
         default=0,
         help="Optional normal-direction bins for voxel triangle merging. 0 merges by centroid only; larger values preserve more differently oriented triangles in the same voxel.",
+    )
+    parser.add_argument(
+        "--mesh-triangle-scale",
+        type=float,
+        default=1.0,
+        help="Scale Kimera mesh seed triangles about their centroids before writing triangle seed files.",
     )
     parser.add_argument(
         "--mesh-triangle-sizing-mode",
@@ -2292,6 +2311,8 @@ def main() -> None:
     capture_dir = Path(args.capture_dir).expanduser().resolve()
     mav0_dir = Path(args.mav0_dir).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
+    if args.mesh_triangle_scale <= 0.0:
+        raise ValueError(f"--mesh-triangle-scale must be > 0, got {args.mesh_triangle_scale}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     images_dir = output_dir / "images"
@@ -2335,6 +2356,7 @@ def main() -> None:
         triangle_merge_mode=args.mesh_triangle_merge_mode,
         triangle_merge_voxel_size=args.mesh_triangle_merge_voxel_size,
         triangle_merge_normal_bins=args.mesh_triangle_merge_normal_bins,
+        triangle_scale=args.mesh_triangle_scale,
         triangle_sizing_mode=args.mesh_triangle_sizing_mode,
         adaptive_min_edge=args.mesh_triangle_adaptive_min_edge,
         adaptive_max_edge=args.mesh_triangle_adaptive_max_edge,
@@ -2494,6 +2516,7 @@ def main() -> None:
         },
         "point_cloud": point_cloud_stats,
         "triangle_soup": triangle_soup_stats,
+        "mesh_triangle_scale": float(args.mesh_triangle_scale),
         "uncovered_fallback": fallback_stats,
         "combined_seed": {
             "mesh_triangle_count": int(len(merged_seed_triangles)),
@@ -2511,6 +2534,7 @@ def main() -> None:
     if len(combined_seed_triangles) > 0:
         seed_stats = {
             "sizing_mode": args.mesh_triangle_sizing_mode,
+            "mesh_triangle_scale": float(args.mesh_triangle_scale),
             "mesh_triangle_count": int(len(merged_seed_triangles)),
             "uncovered_fallback_triangle_count": int(len(fallback_triangles)),
             "output_triangle_count": int(len(combined_seed_triangles)),
