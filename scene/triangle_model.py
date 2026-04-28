@@ -24,12 +24,21 @@ import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func
 from torch import nn
+from dataclasses import dataclass
 import os
 from utils.system_utils import mkdir_p
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 import math
+
+
+@dataclass(frozen=True)
+class TriangleAppendResult:
+    start: int
+    end: int
+    count: int
+    generation_id: int
 
 
 def random_rotation_matrices(num_matrices, device='cpu'):
@@ -209,6 +218,8 @@ class TriangleModel:
         self._num_points_per_triangle = torch.empty(0)
         self._cumsum_of_points_per_triangle = torch.empty(0)
         self._number_of_points = 0
+        self._generation_ids = torch.empty(0, dtype=torch.long)
+        self._next_generation_id = 1
 
         self.split_size = 0
 
@@ -487,6 +498,8 @@ class TriangleModel:
         self.triangle_area = torch.zeros((number_of_points), dtype=torch.float, device="cuda")
         self.image_size = torch.zeros((number_of_points), dtype=torch.float, device="cuda")
         self.importance_score = torch.zeros((number_of_points), dtype=torch.float, device="cuda")
+        self._generation_ids = torch.zeros((number_of_points,), dtype=torch.long, device="cuda")
+        self._next_generation_id = 1
 
     def create_from_triangle_soup(self, triangles_np, colors_np, spatial_lr_scale: float, opacity: float, init_size: float, nb_points: int, set_sigma: float, no_dome: bool):
         if nb_points != 3:
@@ -655,9 +668,17 @@ class TriangleModel:
             masks,
         )
 
-    def append_from_pcd(self, pcd: BasicPointCloud, init_size: float, opacity: float, nb_points: int, set_sigma: float):
+    def append_from_pcd(
+        self,
+        pcd: BasicPointCloud,
+        init_size: float,
+        opacity: float,
+        nb_points: int,
+        set_sigma: float,
+        generation_id: int | None = None,
+    ):
         if pcd is None or len(pcd.points) == 0:
-            return 0
+            return TriangleAppendResult(0, 0, 0, 0)
 
         if self.optimizer is None:
             raise RuntimeError("append_from_pcd requires training_setup() to be called first")
@@ -679,19 +700,19 @@ class TriangleModel:
             set_sigma,
         )
 
-        self.densification_postfix(
+        return self.densification_postfix(
             new_triangles_points,
             new_features_dc,
             new_features_rest,
             new_opacities,
             new_sigma,
             new_mask,
+            generation_id=generation_id,
         )
-        return int(new_triangles_points.shape[0])
 
-    def append_from_triangle_soup(self, triangles_np, colors_np, opacity: float, set_sigma: float):
+    def append_from_triangle_soup(self, triangles_np, colors_np, opacity: float, set_sigma: float, generation_id: int | None = None):
         if triangles_np is None or len(triangles_np) == 0:
-            return 0
+            return TriangleAppendResult(0, 0, 0, 0)
 
         if self.optimizer is None:
             raise RuntimeError("append_from_triangle_soup requires training_setup() to be called first")
@@ -710,15 +731,15 @@ class TriangleModel:
             set_sigma,
         )
 
-        self.densification_postfix(
+        return self.densification_postfix(
             new_triangles_points,
             new_features_dc,
             new_features_rest,
             new_opacities,
             new_sigma,
             new_mask,
+            generation_id=generation_id,
         )
-        return int(new_triangles_points.shape[0])
 
     def training_setup(self, training_args, lr_mask, lr_features, lr_opacity, lr_sigma, lr_triangles_points_init):
 
@@ -841,7 +862,24 @@ class TriangleModel:
         
         return optimizable_tensors
 
-    def densification_postfix(self, new_triangles_points, new_features_dc, new_features_rest, new_opacities, new_sigma, new_mask):
+    def densification_postfix(
+        self,
+        new_triangles_points,
+        new_features_dc,
+        new_features_rest,
+        new_opacities,
+        new_sigma,
+        new_mask,
+        generation_id: int | None = None,
+    ):
+        append_start = int(self.get_triangles_points.shape[0])
+        append_count = int(new_triangles_points.shape[0])
+        if generation_id is None:
+            generation_id = 0
+        else:
+            generation_id = int(generation_id)
+            self._next_generation_id = max(int(self._next_generation_id), generation_id + 1)
+
         d = {"triangles_points": new_triangles_points,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -857,14 +895,39 @@ class TriangleModel:
         self._sigma = optimizable_tensors["sigma"]
         self._mask = optimizable_tensors["mask"]
 
-        self.denom = torch.zeros((self.get_triangles_points.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
-        self.max_density_factor = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
-        self.triangle_area = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
-        self.image_size = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
-        self.importance_score = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
+        device = self.get_triangles_points.device
+        if self.denom.numel() == append_start:
+            self.denom = torch.cat(
+                [self.denom, torch.zeros((append_count, 1), dtype=self.denom.dtype, device=device)],
+                dim=0,
+            )
+        else:
+            self.denom = torch.zeros((self.get_triangles_points.shape[0], 1), device=device)
+        for attr_name in ("max_radii2D", "max_density_factor", "triangle_area", "image_size", "importance_score"):
+            old_value = getattr(self, attr_name)
+            if isinstance(old_value, torch.Tensor) and old_value.numel() == append_start:
+                setattr(
+                    self,
+                    attr_name,
+                    torch.cat(
+                        [old_value, torch.zeros((append_count,), dtype=old_value.dtype, device=device)],
+                        dim=0,
+                    ),
+                )
+            else:
+                setattr(self, attr_name, torch.zeros((self.get_triangles_points.shape[0]), device=device))
 
         self.max_scaling = torch.cat((self.max_scaling, torch.zeros(new_opacities.shape[0], device="cuda")),dim=0)
+        if self._generation_ids.numel() == append_start:
+            new_generation_ids = torch.full(
+                (append_count,),
+                generation_id,
+                dtype=torch.long,
+                device=device,
+            )
+            self._generation_ids = torch.cat([self._generation_ids.to(device), new_generation_ids], dim=0)
+        else:
+            self._generation_ids = torch.zeros((self.get_triangles_points.shape[0],), dtype=torch.long, device=device)
 
         num_points_per_triangle = []
         for i in range(self._triangles_points.size(0)):
@@ -876,6 +939,12 @@ class TriangleModel:
         self._num_points_per_triangle = tensor_num_points_per_triangle
         self._cumsum_of_points_per_triangle = cumsum_of_points_per_triangle
         self._number_of_points = number_of_points
+        return TriangleAppendResult(
+            start=append_start,
+            end=append_start + append_count,
+            count=append_count,
+            generation_id=generation_id,
+        )
 
     def _update_params_small(self, idxs):
         new_triangles_points = self._triangles_points[idxs]
@@ -964,6 +1033,8 @@ class TriangleModel:
 
     def prune_points(self, mask):
         valid_points_mask = ~mask
+        if isinstance(self._generation_ids, torch.Tensor) and self._generation_ids.numel() == valid_points_mask.numel():
+            self._generation_ids = self._generation_ids[valid_points_mask]
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
         self._triangles_points = optimizable_tensors["triangles_points"]
@@ -983,6 +1054,47 @@ class TriangleModel:
         self._num_points_per_triangle = tensor_num_points_per_triangle
         self._cumsum_of_points_per_triangle = cumsum_of_points_per_triangle
         self._number_of_points = number_of_points
+
+    def next_generation_id(self) -> int:
+        generation_id = int(self._next_generation_id)
+        self._next_generation_id = generation_id + 1
+        return generation_id
+
+    def remove_triangle_range(self, start: int, end: int) -> int:
+        start = max(int(start), 0)
+        end = min(int(end), int(self.get_triangles_points.shape[0]))
+        if end <= start:
+            return 0
+        mask = torch.zeros((self.get_triangles_points.shape[0],), dtype=torch.bool, device=self.get_triangles_points.device)
+        mask[start:end] = True
+        self.prune_points(mask)
+        self.triangle_area = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
+        self.image_size = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
+        self.importance_score = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
+        self.denom = torch.zeros((self.get_triangles_points.shape[0], 1), device="cuda")
+        self.max_radii2D = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
+        self.max_density_factor = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
+        return end - start
+
+    def mask_gradients_to_range(self, start: int, end: int) -> None:
+        start = max(int(start), 0)
+        end = min(int(end), int(self.get_triangles_points.shape[0]))
+        if end <= start:
+            return
+        row_mask = torch.zeros((self.get_triangles_points.shape[0],), dtype=torch.float32, device=self.get_triangles_points.device)
+        row_mask[start:end] = 1.0
+        for parameter in (
+            self._features_dc,
+            self._features_rest,
+            self._opacity,
+            self._triangles_points,
+            self._sigma,
+            self._mask,
+        ):
+            if parameter.grad is None or parameter.grad.shape[0] != row_mask.shape[0]:
+                continue
+            view_shape = (row_mask.shape[0],) + (1,) * (parameter.grad.ndim - 1)
+            parameter.grad.mul_(row_mask.view(view_shape))
 
     def add_new_gs(self, cap_max, oddGroup=True, dead_mask=None):
         current_num_points = self._opacity.shape[0]

@@ -209,7 +209,7 @@ class Scene:
                 if initial_triangle_soup is None:
                     raise RuntimeError(
                         "seed_init_mode=mesh_triangle requires Kimera triangle seed files. "
-                        "Run scripts/prepare_kimera_capture_dataset.py to generate mesh_seed_triangles/*.npz."
+                        "Run python -m utils.kimera_capture to generate mesh_seed_triangles/*.npz."
                     )
                 self.triangles.create_from_triangle_soup(
                     initial_triangle_soup[0],

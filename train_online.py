@@ -62,6 +62,8 @@ if __name__ == "__main__":
         args.online_train_unbounded = True
         args.iterations = 0
         args.online_train_stop_when_frames_exhausted = True
+    if args.online_source == "capture":
+        args.seed_init_mode = "mesh_triangle"
     if args.iterations > 0:
         args.save_iterations.append(args.iterations)
 
@@ -97,6 +99,14 @@ if __name__ == "__main__":
             online_train_min_prune_cameras=args.online_train_min_prune_cameras,
             online_train_unbounded=args.online_train_unbounded,
             online_train_stop_when_frames_exhausted=args.online_train_stop_when_frames_exhausted,
+            online_new_triangle_warmup_iters=args.online_new_triangle_warmup_iters,
+            online_guard_buffer_size=args.online_guard_buffer_size,
+            online_guard_sample_count=args.online_guard_sample_count,
+            online_guard_max_mean_psnr_drop=args.online_guard_max_mean_psnr_drop,
+            online_guard_max_frame_psnr_drop=args.online_guard_max_frame_psnr_drop,
+            online_new_triangle_min_prune_age_iters=args.online_new_triangle_min_prune_age_iters,
+            online_prune_max_fraction=args.online_prune_max_fraction,
+            online_max_total_triangles=args.online_max_total_triangles,
         ),
     )
 

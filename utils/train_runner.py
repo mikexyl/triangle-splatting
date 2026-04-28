@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from scene import Scene, TriangleModel
 from scene.dataset_readers import fetchPly, fetchTriangleSoup
+from scene.online_capture_scene import OnlineKimeraCaptureScene
 from triangle_renderer import render
 from utils.image_utils import psnr
 from utils.loss_utils import equilateral_regularizer, l1_loss, l2_loss, ssim
@@ -45,6 +46,40 @@ ONLINE_TRAIN_ARG_NAMES = (
     "online_train_min_prune_cameras",
     "online_train_unbounded",
     "online_train_stop_when_frames_exhausted",
+    "online_source",
+    "online_capture_dir",
+    "online_mav0_dir",
+    "online_camera",
+    "online_max_frames",
+    "online_eval_hold",
+    "online_mesh_triangle_max_edge",
+    "online_mesh_triangle_max_count",
+    "online_mesh_triangle_color_source",
+    "online_mesh_triangle_merge_mode",
+    "online_mesh_triangle_merge_voxel_size",
+    "online_mesh_triangle_merge_normal_bins",
+    "online_mesh_triangle_scale",
+    "online_mesh_triangle_scale_optimize",
+    "online_mesh_triangle_scale_opt_iterations",
+    "online_mesh_triangle_scale_opt_lr",
+    "online_mesh_triangle_scale_opt_min",
+    "online_mesh_triangle_scale_opt_max",
+    "online_mesh_triangle_scale_opt_resolution",
+    "online_mesh_triangle_sizing_mode",
+    "online_mesh_triangle_adaptive_min_edge",
+    "online_mesh_triangle_adaptive_max_edge",
+    "online_mesh_triangle_adaptive_color_threshold",
+    "online_mesh_triangle_adaptive_normal_threshold_deg",
+    "online_mesh_triangle_adaptive_plane_threshold",
+    "online_mesh_triangle_adaptive_max_patch_diameter",
+    "online_new_triangle_warmup_iters",
+    "online_guard_buffer_size",
+    "online_guard_sample_count",
+    "online_guard_max_mean_psnr_drop",
+    "online_guard_max_frame_psnr_drop",
+    "online_new_triangle_min_prune_age_iters",
+    "online_prune_max_fraction",
+    "online_max_total_triangles",
 )
 
 SEED_INIT_ARG_NAMES = (
@@ -64,6 +99,23 @@ class TrainingRunConfig:
     online_train_min_prune_cameras: int = 250
     online_train_unbounded: bool = False
     online_train_stop_when_frames_exhausted: bool = False
+    online_new_triangle_warmup_iters: int = 24
+    online_guard_buffer_size: int = 16
+    online_guard_sample_count: int = 4
+    online_guard_max_mean_psnr_drop: float = 0.5
+    online_guard_max_frame_psnr_drop: float = 1.0
+    online_new_triangle_min_prune_age_iters: int = 100
+    online_prune_max_fraction: float = 0.25
+    online_max_total_triangles: int = 0
+
+
+@dataclass
+class OnlineWarmupGuard:
+    append_result: object
+    start_iteration: int
+    end_iteration: int
+    guard_views: list
+    baseline_psnr: list[float]
 
 
 class _PyramidTrainingView:
@@ -376,6 +428,67 @@ def add_online_training_args(parser) -> None:
         action="store_true",
         help="For unbounded primitive online replay, stop after every train frame has been revealed and optimized for one growth interval.",
     )
+    parser.add_argument(
+        "--online_source",
+        choices=("prepared", "capture"),
+        default="prepared",
+        help="Online input source. 'prepared' replays an existing dataset; 'capture' streams a Kimera capture folder incrementally.",
+    )
+    parser.add_argument("--online_capture_dir", "--capture_dir", dest="online_capture_dir", default="", help="Kimera capture directory for --online_source capture.")
+    parser.add_argument("--online_mav0_dir", "--mav0_dir", dest="online_mav0_dir", default="", help="EuRoC mav0 directory containing camera calibration.")
+    parser.add_argument("--online_camera", default="cam0", help="Capture camera name to train from.")
+    parser.add_argument("--online_max_frames", type=int, default=0, help="Limit capture replay to the first N recorded frames; 0 uses all frames.")
+    parser.add_argument("--online_eval_hold", type=int, default=8, help="Every Nth capture frame is held out for validation; <=0 disables holdout.")
+    parser.add_argument("--online_mesh_triangle_max_edge", type=float, default=0.25)
+    parser.add_argument("--online_mesh_triangle_max_count", type=int, default=500000)
+    parser.add_argument(
+        "--online_mesh_triangle_color_source",
+        choices=("gray", "vertex", "texture"),
+        default="texture",
+    )
+    parser.add_argument(
+        "--online_mesh_triangle_merge_mode",
+        choices=("concat", "voxel"),
+        default="voxel",
+    )
+    parser.add_argument("--online_mesh_triangle_merge_voxel_size", type=float, default=0.05)
+    parser.add_argument("--online_mesh_triangle_merge_normal_bins", type=int, default=0)
+    parser.add_argument("--online_mesh_triangle_scale", type=float, default=5.0)
+    parser.add_argument("--online_mesh_triangle_scale_optimize", action="store_true")
+    parser.add_argument("--online_mesh_triangle_scale_opt_iterations", type=int, default=50)
+    parser.add_argument("--online_mesh_triangle_scale_opt_lr", type=float, default=0.05)
+    parser.add_argument("--online_mesh_triangle_scale_opt_min", type=float, default=0.25)
+    parser.add_argument("--online_mesh_triangle_scale_opt_max", type=float, default=10.0)
+    parser.add_argument("--online_mesh_triangle_scale_opt_resolution", type=int, default=1)
+    parser.add_argument(
+        "--online_mesh_triangle_sizing_mode",
+        choices=("uniform", "texture_adaptive", "coverage_adaptive"),
+        default="coverage_adaptive",
+    )
+    parser.add_argument("--online_mesh_triangle_adaptive_min_edge", type=float, default=0.08)
+    parser.add_argument("--online_mesh_triangle_adaptive_max_edge", type=float, default=0.60)
+    parser.add_argument("--online_mesh_triangle_adaptive_color_threshold", type=float, default=0.03)
+    parser.add_argument("--online_mesh_triangle_adaptive_normal_threshold_deg", type=float, default=10.0)
+    parser.add_argument("--online_mesh_triangle_adaptive_plane_threshold", type=float, default=0.02)
+    parser.add_argument("--online_mesh_triangle_adaptive_max_patch_diameter", type=float, default=0.75)
+    parser.add_argument("--online_new_triangle_warmup_iters", type=int, default=24)
+    parser.add_argument("--online_guard_buffer_size", type=int, default=16)
+    parser.add_argument("--online_guard_sample_count", type=int, default=4)
+    parser.add_argument("--online_guard_max_mean_psnr_drop", type=float, default=0.5)
+    parser.add_argument("--online_guard_max_frame_psnr_drop", type=float, default=1.0)
+    parser.add_argument("--online_new_triangle_min_prune_age_iters", type=int, default=100)
+    parser.add_argument(
+        "--online_prune_max_fraction",
+        type=float,
+        default=0.25,
+        help="Maximum fraction of triangles that one online prune step may mark dead; larger masks are ignored.",
+    )
+    parser.add_argument(
+        "--online_max_total_triangles",
+        type=int,
+        default=0,
+        help="Maximum live triangle count for online training; <=0 disables the cap.",
+    )
 
 
 def copy_named_args(target, source, names) -> None:
@@ -406,13 +519,121 @@ def _merge_triangle_soups(triangle_soups):
     )
 
 
+def _psnr_for_views(views, triangles, pipe, background):
+    values = []
+    with torch.no_grad():
+        for view in views:
+            image = torch.clamp(render(view, triangles, pipe, background)["render"], 0.0, 1.0)
+            target = torch.clamp(view.original_image.to("cuda"), 0.0, 1.0)
+            values.append(float(psnr(image, target).mean().detach().cpu()))
+    return values
+
+
+def _select_online_guard_views(scene, previous_active_count, buffer_size, sample_count):
+    prior_views = scene.getRevealedTrainCameras()[:previous_active_count]
+    if not prior_views:
+        return []
+    buffer_size = max(int(buffer_size), 1)
+    sample_count = max(int(sample_count), 1)
+    buffer = prior_views[-buffer_size:]
+    if len(buffer) <= sample_count:
+        return buffer
+    indices = np.linspace(0, len(buffer) - 1, sample_count, dtype=np.int64)
+    return [buffer[int(idx)] for idx in np.unique(indices)]
+
+
+def _guard_drop_summary(baseline_psnr, current_psnr):
+    if not baseline_psnr or not current_psnr:
+        return 0.0, 0.0
+    drops = np.asarray(baseline_psnr, dtype=np.float32) - np.asarray(current_psnr, dtype=np.float32)
+    return float(np.mean(drops)), float(np.max(drops))
+
+
+def _limit_online_dead_mask(dead_mask, run_config, iteration, label):
+    if not run_config.online_train:
+        return dead_mask
+    total_count = int(dead_mask.numel())
+    dead_count = int(dead_mask.sum().item())
+    if total_count <= 0 or dead_count <= 0:
+        return dead_mask
+    max_fraction = max(float(getattr(run_config, "online_prune_max_fraction", 0.25)), 0.0)
+    dead_fraction = dead_count / float(total_count)
+    if dead_count >= total_count or dead_fraction > max_fraction:
+        print(
+            f"[ITER {iteration}] Skipping unsafe online {label} dead mask: "
+            f"{dead_count}/{total_count} triangles ({dead_fraction:.1%}) exceeds "
+            f"online_prune_max_fraction={max_fraction:.1%}"
+        )
+        return torch.zeros_like(dead_mask)
+    return dead_mask
+
+
+def _online_densification_cap(current_count, opt, run_config, iteration):
+    cap_max = int(opt.max_shapes)
+    if not run_config.online_train:
+        return cap_max
+    max_total = int(getattr(run_config, "online_max_total_triangles", 0))
+    if max_total <= 0:
+        return cap_max
+    capped = min(cap_max, max_total)
+    if current_count >= capped:
+        print(
+            f"[ITER {iteration}] Online densification capped at current live triangle count "
+            f"{current_count} to respect online_max_total_triangles={max_total}"
+        )
+        return current_count
+    return capped
+
+
 def _get_view_seed_path(view, seed_init_mode):
     if seed_init_mode == "mesh_triangle":
         return getattr(view, "seed_triangles_path", None)
     return getattr(view, "seed_points_path", None)
 
 
-def _append_online_seed_geometry(triangles, views, seen_seed_paths, opt, seed_init_mode):
+def _limit_triangle_soup_to_online_budget(triangles_model, triangle_soup, run_config, iteration):
+    max_total = int(getattr(run_config, "online_max_total_triangles", 0))
+    if max_total <= 0 or triangle_soup is None:
+        return triangle_soup
+    current_count = int(triangles_model.get_triangles_points.shape[0])
+    remaining = max_total - current_count
+    if remaining <= 0:
+        print(
+            f"[ITER {iteration}] Skipping online triangle append: current live triangle count "
+            f"{current_count} reached online_max_total_triangles={max_total}"
+        )
+        return None
+    seed_count = int(len(triangle_soup[0]))
+    if seed_count <= remaining:
+        return triangle_soup
+    indices = np.linspace(0, seed_count - 1, remaining, dtype=np.int64)
+    print(
+        f"[ITER {iteration}] Limiting online triangle append from {seed_count} to {remaining} "
+        f"to respect online_max_total_triangles={max_total}"
+    )
+    return triangle_soup[0][indices], triangle_soup[1][indices]
+
+
+def _append_online_seed_geometry(triangles, views, seen_seed_paths, opt, seed_init_mode, run_config, iteration, scene=None):
+    if scene is not None and hasattr(scene, "consume_pending_seed_soup"):
+        seed_triangle_soup = scene.consume_pending_seed_soup()
+        seed_triangle_soup = _limit_triangle_soup_to_online_budget(
+            triangles,
+            seed_triangle_soup,
+            run_config,
+            iteration,
+        )
+        if seed_triangle_soup is None:
+            return None
+        generation_id = triangles.next_generation_id()
+        return triangles.append_from_triangle_soup(
+            seed_triangle_soup[0],
+            seed_triangle_soup[1],
+            opacity=opt.set_opacity,
+            set_sigma=opt.set_sigma,
+            generation_id=generation_id,
+        )
+
     seed_paths = []
     for view in views:
         seed_path = _get_view_seed_path(view, seed_init_mode)
@@ -422,30 +643,40 @@ def _append_online_seed_geometry(triangles, views, seen_seed_paths, opt, seed_in
         seed_paths.append(seed_path)
 
     if not seed_paths:
-        return 0
+        return None
 
     if seed_init_mode == "mesh_triangle":
         seed_triangle_soup = _merge_triangle_soups([fetchTriangleSoup(seed_path) for seed_path in seed_paths])
+        seed_triangle_soup = _limit_triangle_soup_to_online_budget(
+            triangles,
+            seed_triangle_soup,
+            run_config,
+            iteration,
+        )
         if seed_triangle_soup is None:
-            return 0
+            return None
 
+        generation_id = triangles.next_generation_id()
         return triangles.append_from_triangle_soup(
             seed_triangle_soup[0],
             seed_triangle_soup[1],
             opacity=opt.set_opacity,
             set_sigma=opt.set_sigma,
+            generation_id=generation_id,
         )
 
     seed_point_cloud = _merge_point_clouds([fetchPly(seed_path) for seed_path in seed_paths])
     if seed_point_cloud is None:
-        return 0
+        return None
 
+    generation_id = triangles.next_generation_id()
     return triangles.append_from_pcd(
         seed_point_cloud,
         init_size=opt.triangle_size,
         opacity=opt.set_opacity,
         nb_points=opt.nb_points,
         set_sigma=opt.set_sigma,
+        generation_id=generation_id,
     )
 
 
@@ -483,16 +714,30 @@ def run_training(
             raise ValueError("seed_init_mode=mesh_triangle requires --nb_points 3")
 
         triangles = TriangleModel(dataset.sh_degree)
-        scene = Scene(
-            dataset,
-            triangles,
-            opt.set_opacity,
-            opt.triangle_size,
-            opt.nb_points,
-            opt.set_sigma,
-            no_dome,
-            shuffle=not run_config.online_train,
-        )
+        online_source = getattr(dataset, "online_source", "prepared")
+        if online_source == "capture":
+            if seed_init_mode != "mesh_triangle":
+                raise ValueError("--online_source capture requires --seed_init_mode mesh_triangle")
+            scene = OnlineKimeraCaptureScene(
+                dataset,
+                triangles,
+                opt.set_opacity,
+                opt.triangle_size,
+                opt.nb_points,
+                opt.set_sigma,
+                no_dome,
+            )
+        else:
+            scene = Scene(
+                dataset,
+                triangles,
+                opt.set_opacity,
+                opt.triangle_size,
+                opt.nb_points,
+                opt.set_sigma,
+                no_dome,
+                shuffle=not run_config.online_train,
+            )
         if run_config.online_train:
             online_growth_interval, expected_final_count, auto_growth_interval = _resolve_online_growth_schedule(
                 scene,
@@ -560,6 +805,8 @@ def run_training(
                 if _get_view_seed_path(view, seed_init_mode)
             }
         active_train_count = scene.getActiveTrainCameraCount()
+        online_warmup_guard = None
+        latest_online_append_iteration = -1
 
         triangles.training_setup(
             opt,
@@ -651,13 +898,24 @@ def run_training(
             online_schedule_changed = False
             if run_config.online_train and scene.update_online_train_set(iteration):
                 online_schedule_changed = True
+                previous_active_count = active_train_count
                 newly_revealed_views = scene.getNewlyRevealedTrainCameras(active_train_count)
-                added_triangles = _append_online_seed_geometry(
+                guard_views = _select_online_guard_views(
+                    scene,
+                    previous_active_count,
+                    run_config.online_guard_buffer_size,
+                    run_config.online_guard_sample_count,
+                )
+                baseline_guard_psnr = _psnr_for_views(guard_views, triangles, pipe, background) if guard_views else []
+                append_result = _append_online_seed_geometry(
                     triangles,
                     newly_revealed_views,
                     seen_online_seed_paths,
                     opt,
                     seed_init_mode,
+                    run_config,
+                    iteration,
+                    scene=scene,
                 )
                 active_train_count = scene.getActiveTrainCameraCount()
                 viewpoint_stack = scene.getTrainCameras().copy()
@@ -667,8 +925,34 @@ def run_training(
                     f"train cameras revealed, optimizing window of {scene.getActiveTrainWindowCount()} "
                     f"frames starting at index {scene.getActiveTrainWindowStart()}"
                 )
-                if added_triangles > 0:
-                    print(f"[ITER {iteration}] Added {added_triangles} triangles from newly revealed frame meshes")
+                if append_result is not None and append_result.count > 0:
+                    online_warmup_guard = OnlineWarmupGuard(
+                        append_result=append_result,
+                        start_iteration=iteration,
+                        end_iteration=iteration + max(int(run_config.online_new_triangle_warmup_iters), 0) - 1,
+                        guard_views=guard_views,
+                        baseline_psnr=baseline_guard_psnr,
+                    )
+                    latest_online_append_iteration = iteration
+                    print(
+                        f"[ITER {iteration}] Added {append_result.count} online triangles "
+                        f"as generation {append_result.generation_id}; warmup through iteration "
+                        f"{online_warmup_guard.end_iteration}"
+                    )
+                    if hasattr(scene, "getLastOnlineSeedStats"):
+                        for seed_stat in scene.getLastOnlineSeedStats():
+                            scale_stats = seed_stat.scale_optimization or {}
+                            scale_text = ""
+                            if scale_stats:
+                                scale_text = (
+                                    f", scale={scale_stats.get('scale')}, "
+                                    f"scale_psnr={scale_stats.get('psnr')}"
+                                )
+                            print(
+                                f"[ITER {iteration}] Online mesh seed {seed_stat.obj_filename}: "
+                                f"{seed_stat.accepted_triangle_count}/{seed_stat.output_triangle_count} "
+                                f"triangles accepted{scale_text}"
+                            )
 
             if iteration % 1000 == 0:
                 triangles.oneupSHdegree()
@@ -742,6 +1026,15 @@ def run_training(
                 loss = loss_image + loss_opacity + normal_loss + dist_loss
 
             loss.backward()
+            if (
+                online_warmup_guard is not None
+                and iteration <= online_warmup_guard.end_iteration
+                and online_warmup_guard.append_result.count > 0
+            ):
+                triangles.mask_gradients_to_range(
+                    online_warmup_guard.append_result.start,
+                    online_warmup_guard.append_result.end,
+                )
 
             iter_end.record()
 
@@ -846,6 +1139,16 @@ def run_training(
                 allow_online_pruning = (not run_config.online_train) or (
                     active_train_views >= run_config.online_train_min_prune_cameras
                 )
+                if run_config.online_train and allow_online_pruning:
+                    newest_generation_age = (
+                        iteration - latest_online_append_iteration
+                        if latest_online_append_iteration >= 0
+                        else int(run_config.online_new_triangle_min_prune_age_iters)
+                    )
+                    allow_online_pruning = (
+                        online_warmup_guard is None
+                        and newest_generation_age >= int(run_config.online_new_triangle_min_prune_age_iters)
+                    )
 
                 if (
                     iteration < opt.densify_until_iter
@@ -882,6 +1185,7 @@ def run_training(
                             mask_test = triangles.image_size > 1400
                             dead_mask = torch.logical_or(dead_mask, mask_test.squeeze())
 
+                    dead_mask = _limit_online_dead_mask(dead_mask, run_config, iteration, "densification/pruning")
                     total_dead += dead_mask.sum()
 
                     if opt.proba_distr == 0:
@@ -899,7 +1203,13 @@ def run_training(
                     removed_them = True
                     new_round = False
 
-                    triangles.add_new_gs(cap_max=opt.max_shapes, oddGroup=odd_group, dead_mask=dead_mask)
+                    densification_cap = _online_densification_cap(
+                        int(triangles.get_triangles_points.shape[0]),
+                        opt,
+                        run_config,
+                        iteration,
+                    )
+                    triangles.add_new_gs(cap_max=densification_cap, oddGroup=odd_group, dead_mask=dead_mask)
 
                 if iteration > opt.densify_until_iter and iteration % opt.densification_interval == 0:
                     if not allow_online_pruning:
@@ -927,13 +1237,57 @@ def run_training(
                     if not new_round:
                         mask_test = triangles.triangle_area < 2
                         dead_mask = torch.logical_or(dead_mask, mask_test.squeeze())
+                    dead_mask = _limit_online_dead_mask(dead_mask, run_config, iteration, "final pruning")
                     triangles.remove_final_points(dead_mask)
                     removed_them = True
                     new_round = False
 
+                optimizer_stepped = False
                 if effective_final_iteration is None or iteration < effective_final_iteration:
                     triangles.optimizer.step()
                     triangles.optimizer.zero_grad(set_to_none=True)
+                    optimizer_stepped = True
+
+                if (
+                    optimizer_stepped
+                    and online_warmup_guard is not None
+                    and iteration >= online_warmup_guard.end_iteration
+                ):
+                    current_guard_psnr = _psnr_for_views(
+                        online_warmup_guard.guard_views,
+                        triangles,
+                        pipe,
+                        background,
+                    )
+                    mean_drop, max_drop = _guard_drop_summary(
+                        online_warmup_guard.baseline_psnr,
+                        current_guard_psnr,
+                    )
+                    if rerun_logger.enabled:
+                        rerun_logger.log_scalar("online/guard/mean_psnr_drop", "iteration", iteration, mean_drop)
+                        rerun_logger.log_scalar("online/guard/max_psnr_drop", "iteration", iteration, max_drop)
+                    failed_guard = (
+                        mean_drop > float(run_config.online_guard_max_mean_psnr_drop)
+                        or max_drop > float(run_config.online_guard_max_frame_psnr_drop)
+                    )
+                    if failed_guard:
+                        removed_count = triangles.remove_triangle_range(
+                            online_warmup_guard.append_result.start,
+                            online_warmup_guard.append_result.end,
+                        )
+                        print(
+                            f"[ITER {iteration}] Rejected online triangle generation "
+                            f"{online_warmup_guard.append_result.generation_id}: "
+                            f"removed {removed_count} triangles after guard drops "
+                            f"mean={mean_drop:.3f} dB max={max_drop:.3f} dB"
+                        )
+                    else:
+                        print(
+                            f"[ITER {iteration}] Accepted online triangle generation "
+                            f"{online_warmup_guard.append_result.generation_id}: "
+                            f"guard drops mean={mean_drop:.3f} dB max={max_drop:.3f} dB"
+                        )
+                    online_warmup_guard = None
     except KeyboardInterrupt:
         if not run_config.online_train:
             raise

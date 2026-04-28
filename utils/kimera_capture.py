@@ -1081,10 +1081,12 @@ def _adaptive_mesh_triangles(
     normals = _triangle_normals(triangles)
     centers = triangles.mean(axis=1)
     low_complexity = complexity <= max(color_threshold, 0.0)
+    detailed_max_edge = min_edge if min_edge > 0.0 else max_edge
+    patch_max_edge = max_edge if max_edge > 0.0 else detailed_max_edge
     adjacency = _face_adjacency(faces) if len(faces) == len(triangles) else [[] for _ in range(len(triangles))]
     edge_neighbor_count = sum(len(neighbors) for neighbors in adjacency)
     if edge_neighbor_count < max(len(triangles) // 2, 1):
-        spatial_radius = max(max_edge, max_patch_diameter * 0.25, 1e-6)
+        spatial_radius = max(patch_max_edge, max_patch_diameter * 0.25, 1e-6)
         adjacency = _merge_adjacency(adjacency, _spatial_face_adjacency(centers, spatial_radius))
     normal_cos_threshold = math.cos(math.radians(max(normal_threshold_deg, 0.0)))
 
@@ -1135,7 +1137,7 @@ def _adaptive_mesh_triangles(
             continue
 
         patch = np.asarray(patch, dtype=np.int64)
-        coarsened_triangles, plane_error = _patch_to_plane_triangles(triangles[patch], plane_threshold, max_edge)
+        coarsened_triangles, plane_error = _patch_to_plane_triangles(triangles[patch], plane_threshold, patch_max_edge)
         plane_errors.append(plane_error)
         if coarsened_triangles is None:
             detailed_indices.extend(patch.tolist())
@@ -1166,7 +1168,7 @@ def _adaptive_mesh_triangles(
         detailed_max_count = max_count - patch_count if max_count > 0 else 0
         detailed_triangles, detailed_attributes, cap_reached = _subdivide_triangles_by_max_edge(
             detailed_triangles,
-            max_edge=max_edge,
+            max_edge=detailed_max_edge,
             max_count=detailed_max_count,
             vertex_attributes=[detailed_uvs, detailed_vertex_colors],
         )
@@ -1211,6 +1213,8 @@ def _adaptive_mesh_triangles(
         "patch_plane_error": _percentiles(np.asarray(plane_errors, dtype=np.float32)) if plane_errors else {},
         "min_edge": float(min_edge),
         "max_edge": float(max_edge),
+        "detailed_max_edge": float(detailed_max_edge),
+        "patch_max_edge": float(patch_max_edge),
         "color_threshold": float(color_threshold),
         "normal_threshold_deg": float(normal_threshold_deg),
         "plane_threshold": float(plane_threshold),

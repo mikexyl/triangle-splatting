@@ -78,7 +78,7 @@ python train.py -s <path_to_scenes> -m <output_model_path> --eval \
 
 `--pyramid_levels` counts the original image as level 0. The default three-level pyramid uses scales 1, 0.5, and 0.25. Offline training starts from the coarsest level, renders at that scale, and steps toward full-resolution supervision by `--pyramid_schedule_until_iter`. Leave the schedule at `0` to reach full resolution by `--densify_until_iter`.
 
-For primitive online replay with `train_online.py`, runs do not need a user-specified total iteration count. When `--iterations` is omitted, the default `--online_train_camera_growth_interval 10` reveals one new train camera every ten optimization iterations, optimizes over a sliding `--online_train_window_size 10` local frame window, then stops after all train cameras have been revealed and optimized for one final reveal interval. With `--pyramid_training`, online replay switches to per-image pyramid supervision: the latest revealed frame is trained for `--online_train_pyramid_level_iterations 8` iterations at each pyramid level, moving from coarse to fine, so the default three-level run trains 24 iterations per image before revealing the next frame. In this online staged mode, `--pyramid_schedule_until_iter` is ignored. Pass `--iterations <N>` for bounded smoke or benchmark runs, set `--online_train_camera_growth_interval` to a matching positive value to force the staged cadence, or set `--online_train_window_size 0` to restore full-prefix bookkeeping while staged pyramid optimization still targets the latest revealed frame.
+For online training with `train_online.py`, runs do not need a user-specified total iteration count. `--online_source prepared` keeps the legacy prepared-dataset replay. `--online_source capture` streams a Kimera capture folder directly, reveals frames incrementally, generates Kimera mesh triangle seeds in memory, optionally optimizes each new mesh frame's triangle scale, and guards new triangle generations against PSNR regression on a small replay buffer before normal training resumes. When `--iterations` is omitted, the default `--online_train_camera_growth_interval 10` reveals one new train camera every ten optimization iterations, optimizes over a sliding `--online_train_window_size 10` local frame window, then stops after all train cameras have been revealed and optimized for one final reveal interval. With `--pyramid_training`, online replay switches to per-image pyramid supervision: the latest revealed frame is trained for `--online_train_pyramid_level_iterations 8` iterations at each pyramid level, moving from coarse to fine, so the default three-level run trains 24 iterations per image before revealing the next frame. In this online staged mode, `--pyramid_schedule_until_iter` is ignored. Pass `--iterations <N>` for bounded smoke or benchmark runs, set `--online_train_camera_growth_interval` to a matching positive value to force the staged cadence, or set `--online_train_window_size 0` to restore full-prefix bookkeeping while staged pyramid optimization still targets the latest revealed frame. For a denser Kimera mesh online trial, `pixi run train-online-kimera-mesh-vicon-room-1-dense-rerun` uses a 500k per-frame triangle cap, finer voxel merging, and smaller adaptive triangle edges.
 
 ## SfM Initialization Ablation
 
@@ -123,7 +123,7 @@ All generated COLMAP databases, sparse models, undistorted datasets, summaries, 
 Kimera publishes overlapping per-frame meshes, so blindly concatenating every mesh snapshot can create many repeated initial triangles. The dataset converter can reduce the offline triangle soup with centroid-voxel merging while averaging overlapping texture colors:
 
 ```bash
-python scripts/prepare_kimera_capture_dataset.py \
+python -m utils.kimera_capture \
   --capture-dir /home/mikexyl/workspaces/kimera_ros2_ws/artifacts/vicon_room_1 \
   --mav0-dir /data/euroc/V1_01_easy_raw/mav0 \
   --camera cam0 \
@@ -132,7 +132,7 @@ python scripts/prepare_kimera_capture_dataset.py \
   --mesh-sample-spacing 0.05 \
   --mesh-triangle-max-edge 0.25 \
   --mesh-triangle-scale 5.0 \
-  --mesh-triangle-max-count 50000 \
+  --mesh-triangle-max-count 500000 \
   --mesh-triangle-color-source texture \
   --mesh-triangle-merge-mode voxel \
   --mesh-triangle-merge-voxel-size 0.05
