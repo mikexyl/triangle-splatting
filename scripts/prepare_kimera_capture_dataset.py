@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import math
+import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,28 @@ class MeshGeometry:
     face_texcoords: np.ndarray
     vertex_colors: np.ndarray
     texture_path: Path | None
+
+
+@dataclass
+class TriangleScaleOptimizationConfig:
+    enabled: bool
+    iterations: int
+    lr: float
+    min_scale: float
+    max_scale: float
+    resolution: int
+    initial_scale: float
+    opacity: float = 0.28
+    sigma: float = 1.16
+    sh_degree: int = 3
+
+
+@dataclass
+class _ScaleOptimizationPipeline:
+    convert_SHs_python: bool = False
+    compute_cov3D_python: bool = False
+    depth_ratio: float = 1.0
+    debug: bool = False
 
 
 def _quaternion_to_matrix(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
@@ -571,6 +594,292 @@ def _percentiles(values: np.ndarray, percentiles: tuple[int, ...] = (1, 5, 10, 2
         return {}
     computed = np.percentile(values.astype(np.float64, copy=False), percentiles)
     return {f"p{percentile:02d}": float(value) for percentile, value in zip(percentiles, computed)}
+
+
+def _training_frame_rows(frame_rows: list[dict[str, str]], llffhold: int) -> list[dict[str, str]]:
+    if llffhold <= 0:
+        return list(frame_rows)
+    return [row for index, row in enumerate(frame_rows) if index % llffhold != 0]
+
+
+def _camera_rt_from_capture_pose(camera_pose_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    world_to_camera = np.linalg.inv(camera_pose_world)
+    return world_to_camera[:3, :3].T, world_to_camera[:3, 3]
+
+
+def _ensure_repo_root_on_path() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+
+class _TriangleFrameScaleOptimizer:
+    def __init__(
+        self,
+        config: TriangleScaleOptimizationConfig,
+        train_frame_rows: list[dict[str, str]],
+        calibration: CameraCalibration,
+        new_camera_matrix: np.ndarray,
+        fx: float,
+        fy: float,
+    ) -> None:
+        self.config = config
+        self.train_frame_rows = sorted(train_frame_rows, key=lambda row: int(row["image_timestamp_ns"]))
+        self.train_frame_times = np.asarray(
+            [int(row["image_timestamp_ns"]) for row in self.train_frame_rows],
+            dtype=np.int64,
+        )
+        self.calibration = calibration
+        self.new_camera_matrix = new_camera_matrix
+        self.fx = float(fx)
+        self.fy = float(fy)
+        self._imports_loaded = False
+        self._torch = None
+        self._Camera = None
+        self._TriangleModel = None
+        self._render = None
+        self._pipeline = _ScaleOptimizationPipeline()
+        self._background = None
+
+    def _load_imports(self) -> None:
+        if self._imports_loaded:
+            return
+
+        _ensure_repo_root_on_path()
+        import torch
+        from scene.cameras import Camera
+        from scene.triangle_model import TriangleModel
+        from triangle_renderer import render
+
+        self._torch = torch
+        self._Camera = Camera
+        self._TriangleModel = TriangleModel
+        self._render = render
+        try:
+            self._background = torch.zeros((3,), dtype=torch.float32, device="cuda")
+        except RuntimeError as exc:
+            raise RuntimeError("--mesh-triangle-scale-optimize requires CUDA") from exc
+        self._imports_loaded = True
+
+    def _nearest_train_row(self, mesh_time_ns: int) -> dict[str, str] | None:
+        if len(self.train_frame_rows) == 0:
+            return None
+
+        insert_idx = int(np.searchsorted(self.train_frame_times, mesh_time_ns))
+        candidate_indices = []
+        if insert_idx < len(self.train_frame_rows):
+            candidate_indices.append(insert_idx)
+        if insert_idx > 0:
+            candidate_indices.append(insert_idx - 1)
+
+        return self.train_frame_rows[
+            min(candidate_indices, key=lambda idx: abs(int(self.train_frame_times[idx]) - mesh_time_ns))
+        ]
+
+    def _build_camera(self, frame_row: dict[str, str]):
+        self._load_imports()
+        image = _load_undistorted_rgb_image(
+            Path(frame_row["_image_path"]),
+            self.calibration,
+            self.new_camera_matrix,
+        )
+        if image is None:
+            return None
+
+        resolution = max(int(self.config.resolution), 1)
+        if resolution > 1:
+            width = max(int(round(image.shape[1] / resolution)), 1)
+            height = max(int(round(image.shape[0] / resolution)), 1)
+            image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+            fx = self.fx / resolution
+            fy = self.fy / resolution
+        else:
+            height, width = image.shape[:2]
+            fx = self.fx
+            fy = self.fy
+
+        image_tensor = self._torch.from_numpy(
+            np.ascontiguousarray(image.transpose(2, 0, 1)).astype(np.float32) / 255.0
+        )
+        rotation, translation = _camera_rt_from_capture_pose(frame_row["_camera_pose_world"])
+        fovx = 2.0 * math.atan(width / (2.0 * fx))
+        fovy = 2.0 * math.atan(height / (2.0 * fy))
+        return self._Camera(
+            colmap_id=int(frame_row["image_timestamp_ns"]),
+            R=rotation,
+            T=translation,
+            FoVx=fovx,
+            FoVy=fovy,
+            image=image_tensor,
+            gt_alpha_mask=None,
+            image_name=Path(frame_row["_image_path"]).stem,
+            uid=0,
+            data_device="cuda",
+        )
+
+    def _build_render_model(self, triangles: np.ndarray, colors: np.ndarray):
+        self._load_imports()
+        model = self._TriangleModel(self.config.sh_degree)
+        (
+            features_dc,
+            features_rest,
+            points_per_triangle,
+            opacities,
+            sigmas,
+            masks,
+        ) = model._build_triangle_tensors_from_triangle_soup(
+            triangles,
+            colors,
+            self.config.opacity,
+            self.config.sigma,
+        )
+        (
+            model._num_points_per_triangle,
+            model._cumsum_of_points_per_triangle,
+            model._number_of_points,
+        ) = model._triangle_metadata_from_points(points_per_triangle)
+        model._features_dc = features_dc.detach()
+        model._features_rest = features_rest.detach()
+        model._opacity = opacities.detach()
+        model._sigma = sigmas.detach()
+        model._mask = masks.detach()
+        model._triangles_points = points_per_triangle.detach()
+        model.nb_points = 3
+        model.spatial_lr_scale = 1.0
+        point_count = int(points_per_triangle.shape[0])
+        model.max_scaling = self._torch.zeros((point_count,), dtype=self._torch.float32, device="cuda")
+        model.max_radii2D = self._torch.zeros((point_count,), dtype=self._torch.float32, device="cuda")
+        model.max_density_factor = self._torch.zeros((point_count,), dtype=self._torch.float32, device="cuda")
+        model.triangle_area = self._torch.zeros((point_count,), dtype=self._torch.float32, device="cuda")
+        model.image_size = self._torch.zeros((point_count,), dtype=self._torch.float32, device="cuda")
+        model.importance_score = self._torch.zeros((point_count,), dtype=self._torch.float32, device="cuda")
+        return model, points_per_triangle.detach()
+
+    def optimize(
+        self,
+        triangles: np.ndarray,
+        colors: np.ndarray,
+        mesh_time_ns: int,
+        obj_filename: str,
+    ) -> tuple[np.ndarray, dict[str, object]]:
+        frame_row = self._nearest_train_row(mesh_time_ns)
+        if frame_row is None:
+            scaled = _scale_triangles_about_centroids(triangles, self.config.initial_scale)
+            return scaled, {
+                "obj_filename": obj_filename,
+                "enabled": True,
+                "skipped": True,
+                "skip_reason": "no_train_frames",
+                "scale": float(self.config.initial_scale),
+                "initial_scale": float(self.config.initial_scale),
+                "iterations": 0,
+                "psnr": None,
+                "image_time_ns": None,
+            }
+
+        camera = self._build_camera(frame_row)
+        if camera is None:
+            scaled = _scale_triangles_about_centroids(triangles, self.config.initial_scale)
+            return scaled, {
+                "obj_filename": obj_filename,
+                "enabled": True,
+                "skipped": True,
+                "skip_reason": "failed_to_load_nearest_image",
+                "scale": float(self.config.initial_scale),
+                "initial_scale": float(self.config.initial_scale),
+                "iterations": 0,
+                "psnr": None,
+                "image_time_ns": int(frame_row["image_timestamp_ns"]),
+            }
+
+        model, base_points = self._build_render_model(triangles, colors)
+        centers = base_points.mean(dim=1, keepdim=True)
+        offsets = base_points - centers
+
+        normalized_initial = (self.config.initial_scale - self.config.min_scale) / (
+            self.config.max_scale - self.config.min_scale
+        )
+        normalized_initial = min(max(float(normalized_initial), 1e-4), 1.0 - 1e-4)
+        raw_scale = self._torch.logit(
+            self._torch.tensor(normalized_initial, dtype=self._torch.float32, device="cuda")
+        )
+        raw_scale.requires_grad_(True)
+        optimizer = self._torch.optim.Adam([raw_scale], lr=self.config.lr)
+
+        best_scale = float(self.config.initial_scale)
+        best_psnr = None
+        best_loss = None
+        completed_iterations = 0
+        for iteration in range(1, self.config.iterations + 1):
+            scale = self.config.min_scale + (self.config.max_scale - self.config.min_scale) * self._torch.sigmoid(
+                raw_scale
+            )
+            model._triangles_points = centers + scale * offsets
+            rendering = self._torch.clamp(
+                self._render(camera, model, self._pipeline, self._background)["render"],
+                0.0,
+                1.0,
+            )
+            target = camera.original_image[0:3, :, :]
+            loss = self._torch.mean((rendering - target) ** 2)
+            if not bool(self._torch.isfinite(loss).detach().cpu()):
+                break
+
+            loss_value = float(loss.detach().cpu())
+            psnr = -10.0 * math.log10(max(loss_value, 1e-12))
+            if best_loss is None or loss_value < best_loss:
+                best_loss = loss_value
+                best_psnr = psnr
+                best_scale = float(scale.detach().cpu())
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            completed_iterations = iteration
+
+        del camera
+        del model
+        self._torch.cuda.empty_cache()
+
+        scaled = _scale_triangles_about_centroids(triangles, best_scale)
+        result = {
+            "obj_filename": obj_filename,
+            "enabled": True,
+            "skipped": best_psnr is None,
+            "skip_reason": None if best_psnr is not None else "non_finite_loss",
+            "scale": float(best_scale),
+            "initial_scale": float(self.config.initial_scale),
+            "iterations": int(completed_iterations),
+            "psnr": None if best_psnr is None else float(best_psnr),
+            "loss": None if best_loss is None else float(best_loss),
+            "image_time_ns": int(frame_row["image_timestamp_ns"]),
+            "mesh_time_ns": int(mesh_time_ns),
+        }
+        return scaled, result
+
+
+def _summarize_scale_optimization(
+    config: TriangleScaleOptimizationConfig,
+    results: list[dict[str, object]],
+) -> dict[str, object]:
+    successful = [result for result in results if not result.get("skipped")]
+    skipped = [result for result in results if result.get("skipped")]
+    scales = np.asarray([result["scale"] for result in successful], dtype=np.float32)
+    psnrs = np.asarray([result["psnr"] for result in successful if result.get("psnr") is not None], dtype=np.float32)
+    return {
+        "enabled": bool(config.enabled),
+        "initial_scale": float(config.initial_scale),
+        "iterations": int(config.iterations),
+        "lr": float(config.lr),
+        "min_scale": float(config.min_scale),
+        "max_scale": float(config.max_scale),
+        "resolution": int(config.resolution),
+        "optimized_file_count": int(len(successful)),
+        "skipped_file_count": int(len(skipped)),
+        "scale": _percentiles(scales),
+        "psnr": _percentiles(psnrs),
+        "per_file_preview": results[:5],
+    }
 
 
 def _triangle_texture_samples(
@@ -1797,7 +2106,18 @@ def _build_mesh_seed_entries(
     adaptive_normal_threshold_deg: float,
     adaptive_plane_threshold: float,
     adaptive_max_patch_diameter: float,
+    scale_optimizer: _TriangleFrameScaleOptimizer | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, object], dict[str, object], np.ndarray, np.ndarray, np.ndarray]:
+    scale_opt_results = []
+
+    def add_scale_optimization_stats(stats: dict[str, object]) -> dict[str, object]:
+        if scale_optimizer is not None:
+            stats["scale_optimization"] = _summarize_scale_optimization(
+                scale_optimizer.config,
+                scale_opt_results,
+            )
+        return stats
+
     empty_reduction = _triangle_reduction_summary(
         triangle_merge_mode,
         0,
@@ -1814,7 +2134,7 @@ def _build_mesh_seed_entries(
             "input_face_count": 0,
             "sampled_point_count": 0,
             "output_point_count": 0,
-        }, {
+        }, add_scale_optimization_stats({
             "mesh_seed_file_count": 0,
             "output_triangle_count": 0,
             "cap_reached_file_count": 0,
@@ -1826,7 +2146,7 @@ def _build_mesh_seed_entries(
             "sizing_mode": triangle_sizing_mode,
             "scale": float(triangle_scale),
             "reduction": empty_reduction,
-        }, np.empty((0, 3), dtype=np.float32), np.empty((0, 3, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32)
+        }), np.empty((0, 3), dtype=np.float32), np.empty((0, 3, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32)
 
     all_points = []
     all_triangles = []
@@ -1865,12 +2185,15 @@ def _build_mesh_seed_entries(
         if len(vertices) == 0:
             continue
 
+        mesh_timestamp = row.get("mesh_timestamp_ns", "").strip() or row.get("pose_timestamp_ns", "").strip()
+        mesh_time_ns = int(mesh_timestamp) if mesh_timestamp else len(mesh_seed_entries)
         triangle_seed_rel_path = None
         triangle_count = 0
         textured_triangle_count = 0
         triangle_cap_reached = False
         color_source = None
         adaptive_stats = None
+        scale_opt_result = None
         if len(faces) > 0:
             mesh_triangles = vertices[faces]
             uv_triangles = None
@@ -1929,7 +2252,16 @@ def _build_mesh_seed_entries(
                             **(adaptive_stats or {}),
                         }
                     )
-                mesh_triangles = _scale_triangles_about_centroids(mesh_triangles, triangle_scale)
+                if scale_optimizer is not None:
+                    mesh_triangles, scale_opt_result = scale_optimizer.optimize(
+                        mesh_triangles,
+                        triangle_colors,
+                        mesh_time_ns,
+                        obj_filename,
+                    )
+                    scale_opt_results.append(scale_opt_result)
+                else:
+                    mesh_triangles = _scale_triangles_about_centroids(mesh_triangles, triangle_scale)
                 textured_triangle_count = int(triangle_texture_mask.sum())
                 triangle_seed_file_count += 1
                 if textured_triangle_count > 0:
@@ -1965,24 +2297,33 @@ def _build_mesh_seed_entries(
         total_face_count += int(len(faces))
         total_sampled_point_count += int(len(surface_points))
         all_points.append(mesh_points)
-        mesh_timestamp = row.get("mesh_timestamp_ns", "").strip() or row.get("pose_timestamp_ns", "").strip()
         seed_rel_path = f"mesh_seed_points/{Path(obj_filename).stem}.ply"
         _write_point_cloud_ply(output_dir / seed_rel_path, mesh_points)
-        mesh_seed_entries.append(
-            {
-                "time_ns": int(mesh_timestamp) if mesh_timestamp else mesh_count - 1,
-                "seed_rel_path": seed_rel_path,
-                "triangle_seed_rel_path": triangle_seed_rel_path,
-                "point_count": int(len(mesh_points)),
-                "triangle_count": triangle_count,
-                "textured_triangle_count": textured_triangle_count,
-                "triangle_cap_reached": triangle_cap_reached,
-                "texture_filename": row.get("texture_filename", "").strip() or None,
-                "texture_path": str(mesh.texture_path) if mesh.texture_path else None,
-                "triangle_color_source": color_source if triangle_count > 0 else None,
-                "obj_filename": obj_filename,
-            }
-        )
+        mesh_seed_entry = {
+            "time_ns": mesh_time_ns,
+            "seed_rel_path": seed_rel_path,
+            "triangle_seed_rel_path": triangle_seed_rel_path,
+            "point_count": int(len(mesh_points)),
+            "triangle_count": triangle_count,
+            "textured_triangle_count": textured_triangle_count,
+            "triangle_cap_reached": triangle_cap_reached,
+            "texture_filename": row.get("texture_filename", "").strip() or None,
+            "texture_path": str(mesh.texture_path) if mesh.texture_path else None,
+            "triangle_color_source": color_source if triangle_count > 0 else None,
+            "obj_filename": obj_filename,
+        }
+        if scale_opt_result is not None:
+            mesh_seed_entry.update(
+                {
+                    "optimized_triangle_scale": scale_opt_result.get("scale"),
+                    "scale_opt_psnr": scale_opt_result.get("psnr"),
+                    "scale_opt_iterations": scale_opt_result.get("iterations"),
+                    "scale_opt_image_time_ns": scale_opt_result.get("image_time_ns"),
+                    "scale_opt_skipped": scale_opt_result.get("skipped", False),
+                    "scale_opt_skip_reason": scale_opt_result.get("skip_reason"),
+                }
+            )
+        mesh_seed_entries.append(mesh_seed_entry)
 
     if not all_points:
         return mesh_seed_entries, {
@@ -1992,7 +2333,7 @@ def _build_mesh_seed_entries(
             "input_face_count": 0,
             "sampled_point_count": 0,
             "output_point_count": 0,
-        }, {
+        }, add_scale_optimization_stats({
             "mesh_seed_file_count": triangle_seed_file_count,
             "output_triangle_count": total_output_triangle_count,
             "cap_reached_file_count": triangle_cap_reached_file_count,
@@ -2004,7 +2345,7 @@ def _build_mesh_seed_entries(
             "sizing_mode": triangle_sizing_mode,
             "scale": float(triangle_scale),
             "reduction": empty_reduction,
-        }, np.empty((0, 3), dtype=np.float32), np.empty((0, 3, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32)
+        }), np.empty((0, 3), dtype=np.float32), np.empty((0, 3, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32)
 
     points = _downsample_points(np.concatenate(all_points, axis=0), voxel_size)
     triangles = (
@@ -2064,7 +2405,7 @@ def _build_mesh_seed_entries(
         "sampled_point_count": total_sampled_point_count,
         "output_point_count": int(len(points)),
         "sample_spacing": float(effective_sample_spacing),
-    }, {
+    }, add_scale_optimization_stats({
         "mesh_seed_file_count": triangle_seed_file_count,
         "output_triangle_count": int(len(triangles)),
         "per_frame_triangle_count": int(total_output_triangle_count),
@@ -2081,7 +2422,7 @@ def _build_mesh_seed_entries(
         "area": _percentiles(_triangle_areas(triangles)),
         "max_edge_distribution": _percentiles(_triangle_max_edges(triangles)) if len(triangles) else {},
         "reduction": triangle_reduction_stats,
-    }, points, triangles, triangle_colors
+    }), points, triangles, triangle_colors
 
 
 def _select_mesh_seed_entry(frame_time_ns: int, mesh_seed_entries: list[dict[str, object]]) -> dict[str, object] | None:
@@ -2180,6 +2521,41 @@ def main() -> None:
         type=float,
         default=1.0,
         help="Scale Kimera mesh seed triangles about their centroids before writing triangle seed files.",
+    )
+    parser.add_argument(
+        "--mesh-triangle-scale-optimize",
+        action="store_true",
+        help="Learn one image-supervised scale per Kimera mesh frame before writing triangle seed files.",
+    )
+    parser.add_argument(
+        "--mesh-triangle-scale-opt-iterations",
+        type=int,
+        default=50,
+        help="Scale-only optimization steps per mesh frame when --mesh-triangle-scale-optimize is enabled.",
+    )
+    parser.add_argument(
+        "--mesh-triangle-scale-opt-lr",
+        type=float,
+        default=0.05,
+        help="Adam learning rate for per-frame triangle scale optimization.",
+    )
+    parser.add_argument(
+        "--mesh-triangle-scale-opt-min",
+        type=float,
+        default=0.25,
+        help="Minimum learned per-frame triangle scale.",
+    )
+    parser.add_argument(
+        "--mesh-triangle-scale-opt-max",
+        type=float,
+        default=10.0,
+        help="Maximum learned per-frame triangle scale.",
+    )
+    parser.add_argument(
+        "--mesh-triangle-scale-opt-resolution",
+        type=int,
+        default=1,
+        help="Integer image downscale factor for per-frame scale optimization; 1 uses full resolution.",
     )
     parser.add_argument(
         "--mesh-triangle-sizing-mode",
@@ -2313,6 +2689,33 @@ def main() -> None:
     output_dir = Path(args.output_dir).expanduser().resolve()
     if args.mesh_triangle_scale <= 0.0:
         raise ValueError(f"--mesh-triangle-scale must be > 0, got {args.mesh_triangle_scale}")
+    if args.mesh_triangle_scale_optimize:
+        if args.mesh_triangle_scale_opt_iterations <= 0:
+            raise ValueError(
+                "--mesh-triangle-scale-opt-iterations must be > 0, "
+                f"got {args.mesh_triangle_scale_opt_iterations}"
+            )
+        if args.mesh_triangle_scale_opt_lr <= 0.0:
+            raise ValueError(f"--mesh-triangle-scale-opt-lr must be > 0, got {args.mesh_triangle_scale_opt_lr}")
+        if args.mesh_triangle_scale_opt_min <= 0.0:
+            raise ValueError(f"--mesh-triangle-scale-opt-min must be > 0, got {args.mesh_triangle_scale_opt_min}")
+        if args.mesh_triangle_scale_opt_max <= args.mesh_triangle_scale_opt_min:
+            raise ValueError(
+                "--mesh-triangle-scale-opt-max must be greater than --mesh-triangle-scale-opt-min, "
+                f"got {args.mesh_triangle_scale_opt_max} <= {args.mesh_triangle_scale_opt_min}"
+            )
+        if not args.mesh_triangle_scale_opt_min <= args.mesh_triangle_scale <= args.mesh_triangle_scale_opt_max:
+            raise ValueError(
+                "--mesh-triangle-scale must lie within the optimization bounds when "
+                "--mesh-triangle-scale-optimize is enabled, got "
+                f"{args.mesh_triangle_scale} outside "
+                f"[{args.mesh_triangle_scale_opt_min}, {args.mesh_triangle_scale_opt_max}]"
+            )
+        if args.mesh_triangle_scale_opt_resolution <= 0:
+            raise ValueError(
+                "--mesh-triangle-scale-opt-resolution must be > 0, "
+                f"got {args.mesh_triangle_scale_opt_resolution}"
+            )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     images_dir = output_dir / "images"
@@ -2338,6 +2741,25 @@ def main() -> None:
     new_fy = float(new_camera_matrix[1, 1])
     new_cx = float(new_camera_matrix[0, 2])
     new_cy = float(new_camera_matrix[1, 2])
+    scale_optimizer = None
+    if args.mesh_triangle_scale_optimize:
+        scale_optimizer = _TriangleFrameScaleOptimizer(
+            TriangleScaleOptimizationConfig(
+                enabled=True,
+                iterations=args.mesh_triangle_scale_opt_iterations,
+                lr=args.mesh_triangle_scale_opt_lr,
+                min_scale=args.mesh_triangle_scale_opt_min,
+                max_scale=args.mesh_triangle_scale_opt_max,
+                resolution=args.mesh_triangle_scale_opt_resolution,
+                initial_scale=args.mesh_triangle_scale,
+            ),
+            _training_frame_rows(frame_rows, args.llffhold),
+            calibration,
+            new_camera_matrix,
+            new_fx,
+            new_fy,
+        )
+        scale_optimizer._load_imports()
     (
         mesh_seed_entries,
         point_cloud_stats,
@@ -2364,6 +2786,7 @@ def main() -> None:
         adaptive_normal_threshold_deg=args.mesh_triangle_adaptive_normal_threshold_deg,
         adaptive_plane_threshold=args.mesh_triangle_adaptive_plane_threshold,
         adaptive_max_patch_diameter=args.mesh_triangle_adaptive_max_patch_diameter,
+        scale_optimizer=scale_optimizer,
     )
     if len(merged_seed_points) > 0:
         _write_point_cloud_ply(output_dir / "points3d.ply", merged_seed_points)
@@ -2497,6 +2920,7 @@ def main() -> None:
         test_frames,
     )
 
+    scale_optimization_stats = triangle_soup_stats.get("scale_optimization")
     conversion_summary = {
         "source_capture_dir": str(capture_dir),
         "source_mav0_dir": str(mav0_dir),
@@ -2531,6 +2955,9 @@ def main() -> None:
             ),
         },
     }
+    if scale_optimization_stats is not None:
+        conversion_summary["mesh_triangle_scale_optimization"] = scale_optimization_stats
+
     if len(combined_seed_triangles) > 0:
         seed_stats = {
             "sizing_mode": args.mesh_triangle_sizing_mode,
@@ -2551,6 +2978,8 @@ def main() -> None:
             "adaptive": triangle_soup_stats.get("adaptive", {}),
             "coverage": fallback_stats,
         }
+        if scale_optimization_stats is not None:
+            seed_stats["scale_optimization"] = scale_optimization_stats
         (output_dir / "mesh_seed_triangles" / "seed_stats.json").write_text(
             json.dumps(seed_stats, indent=2) + "\n",
             encoding="utf-8",
